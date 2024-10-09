@@ -186,12 +186,16 @@ type LivepeerConfig struct {
 	LiveOutSegmentTimeout      *time.Duration
 	LiveAICapReportInterval    *time.Duration
 	LiveAICapRefreshModels     *string
-	LiveAISaveNSegments        *int
-	EventSinkURIs              *string
-	EventSinkHeaders           *string
-	EventSinkQueueDepth        *int
-	EventSinkBatchSize         *int
-	EventSinkFlushInterval     *time.Duration
+	WebhookRefreshInterval     *time.Duration
+	AISessionTimeout           *time.Duration
+	AITesterGateway            *bool
+
+	LiveAISaveNSegments    *int
+	EventSinkURIs          *string
+	EventSinkHeaders       *string
+	EventSinkQueueDepth    *int
+	EventSinkBatchSize     *int
+	EventSinkFlushInterval *time.Duration
 
 	// ** Pool Customization **
 	RemoteWorkerWebhookURL *string
@@ -250,6 +254,10 @@ func DefaultLivepeerConfig() LivepeerConfig {
 	defaultLiveOutSegmentTimeout := 0 * time.Second
 	defaultGatewayHost := ""
 	defaultLiveAIHeartbeatInterval := 5 * time.Second
+
+	defaultAISessionTimeout := 10 * time.Minute
+	defaultWebhookRefreshInterval := 1 * time.Minute
+	defaultAITesterGateway := false
 
 	// Onchain:
 	defaultEthAcctAddr := ""
@@ -360,6 +368,8 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		TestTranscoder:       &defaultTestTranscoder,
 
 		// AI:
+		AISessionTimeout:         &defaultAISessionTimeout,
+		AITesterGateway:          &defaultAITesterGateway,
 		AIServiceRegistry:        &defaultAIServiceRegistry,
 		AIWorker:                 &defaultAIWorker,
 		AIModels:                 &defaultAIModels,
@@ -428,8 +438,9 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		FVfailGsKey:    &defaultFVfailGsKey,
 
 		// API
-		AuthWebhookURL: &defaultAuthWebhookURL,
-		OrchWebhookURL: &defaultOrchWebhookURL,
+		AuthWebhookURL:         &defaultAuthWebhookURL,
+		OrchWebhookURL:         &defaultOrchWebhookURL,
+		WebhookRefreshInterval: &defaultWebhookRefreshInterval,
 
 		// Versioning constraints
 		OrchMinLivepeerVersion: &defaultMinLivepeerVersion,
@@ -1227,6 +1238,8 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 					server.BroadcastCfg.SetCapabilityMaxPrice(cap, p.ModelID, autoCapPrice)
 				}
 			}
+			n.AITesterGateway = *cfg.AITesterGateway
+			n.AISessionTimeout = *cfg.AISessionTimeout
 		}
 
 		if n.NodeType == core.RedeemerNode {
@@ -1634,7 +1647,8 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 				glog.Exit("Error setting orch webhook URL ", err)
 			}
 			glog.Info("Using orchestrator webhook URL ", whurl)
-			n.OrchestratorPool = discovery.NewWebhookPool(bcast, whurl, *cfg.DiscoveryTimeout)
+			glog.Info("Using orchestrator webhook refresh interval ", *cfg.WebhookRefreshInterval)
+			n.OrchestratorPool = discovery.NewWebhookPool(bcast, whurl, *cfg.DiscoveryTimeout, *cfg.WebhookRefreshInterval)
 		} else if len(orchURLs) > 0 {
 			n.OrchestratorPool = discovery.NewOrchestratorPool(bcast, orchURLs, common.Score_Trusted, orchBlacklist, *cfg.DiscoveryTimeout)
 		}
