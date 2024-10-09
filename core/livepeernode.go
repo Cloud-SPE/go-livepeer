@@ -120,6 +120,8 @@ type LivepeerNode struct {
 	Database *common.DB
 
 	// AI worker public fields
+	AISessionTimeout time.Duration
+	AITesterGateway  bool
 	AIWorker                  AI
 	AIWorkerManager           *RemoteAIWorkerManager
 	AIProcesssingRetryTimeout time.Duration
