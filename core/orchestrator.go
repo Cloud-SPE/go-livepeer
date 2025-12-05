@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
-	"github.com/livepeer/go-livepeer/events"
 	"io/ioutil"
 	"math/big"
 	"net/url"
@@ -1103,8 +1102,15 @@ func (rtm *RemoteTranscoderManager) Manage(node *LivepeerNode, stream net.Transc
 	}()
 
 	// ** Pool Customization **
-	thisAddr := ethereumAddr.String()
-	events.GlobalEventTracker.CreateEventLog("worker-connected", "ethAddress", thisAddr, "connection", from)
+	if lpmon.Enabled {
+		thisAddr := ethereumAddr.String()
+		evt := lpmon.EventData{
+			"ethAddress": thisAddr,
+			"connection": from,
+		}
+
+		lpmon.QueueEvent("worker-connected", evt)
+	}
 	rtm.RTmutex.Lock()
 	rtm.liveTranscoders[transcoder.stream] = transcoder
 	rtm.remoteTranscoders = append(rtm.remoteTranscoders, transcoder)
@@ -1125,9 +1131,15 @@ func (rtm *RemoteTranscoderManager) Manage(node *LivepeerNode, stream net.Transc
 	delete(rtm.liveTranscoders, transcoder.stream)
 	if lpmon.Enabled {
 		totalLoad, totalCapacity, liveTranscodersNum = rtm.totalLoadAndCapacity()
+		// ** Pool Customization **
+		thisAddr := ethereumAddr.String()
+		evt := lpmon.EventData{
+			"ethAddress": thisAddr,
+			"connection": from,
+		}
+
+		lpmon.QueueEvent("worker-disconnected", evt)
 	}
-	// ** Pool Customization **
-	events.GlobalEventTracker.CreateEventLog("worker-disconnected", "ethAddress", thisAddr, "connection", from)
 	rtm.RTmutex.Unlock()
 	if lpmon.Enabled {
 		lpmon.SetTranscodersNumberAndLoad(totalLoad, totalCapacity, liveTranscodersNum)
@@ -1311,6 +1323,18 @@ func OnTranscode(ctx context.Context, currentTranscoder *RemoteTranscoder, md *S
 		realTimeRatio = duration / responseTime
 	}
 	// Log event with calculated price and fees
-	events.GlobalEventTracker.CreateEventLog("job-processed", "ethAddress", currentTranscoder.ethereumAddr.String(), "computeUnits", encodedPixels, "responseTime", responseTime, "realTimeRatio", realTimeRatio, "pricePerComputeUnit", basePriceInt, "fees", fees, "duration", duration)
-	glog.Infof("Write transcode record for %v", currentTranscoder.ethereumAddr.String())
+	if lpmon.Enabled {
+		evt := lpmon.EventData{
+			"ethAddress":          currentTranscoder.ethereumAddr.String(),
+			"computeUnits":        encodedPixels,
+			"responseTime":        responseTime,
+			"realTimeRatio":       realTimeRatio,
+			"pricePerComputeUnit": basePriceInt,
+			"fees":                fees,
+			"duration":            duration,
+		}
+
+		lpmon.QueueEvent("job-processed", evt)
+		glog.Infof("Write transcode record for %v", currentTranscoder.ethereumAddr.String())
+	}
 }

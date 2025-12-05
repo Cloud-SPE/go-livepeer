@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/livepeer/go-livepeer/events"
 	"io"
 	"io/ioutil"
 	"math"
@@ -178,11 +177,6 @@ type LivepeerConfig struct {
 	KafkaUsername              *string
 	KafkaPassword              *string
 	KafkaGatewayTopic          *string
-	EventSinkURIs              *string
-	EventSinkHeaders           *string
-	EventSinkQueueDepth        *int
-	EventSinkBatchSize         *int
-	EventSinkFlushInterval     *time.Duration
 	MediaMTXApiPassword        *string
 	LiveAIAuthApiKey           *string
 	LiveAIHeartbeatURL         *string
@@ -190,8 +184,15 @@ type LivepeerConfig struct {
 	LiveAIHeartbeatInterval    *time.Duration
 	LivePaymentInterval        *time.Duration
 	LiveOutSegmentTimeout      *time.Duration
+	LiveAICapReportInterval    *time.Duration
 	LiveAICapRefreshModels     *string
 	LiveAISaveNSegments        *int
+	EventSinkURIs              *string
+	EventSinkHeaders           *string
+	EventSinkQueueDepth        *int
+	EventSinkBatchSize         *int
+	EventSinkFlushInterval     *time.Duration
+
 	// ** Pool Customization **
 	RemoteWorkerWebhookURL *string
 }
@@ -430,9 +431,6 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		AuthWebhookURL: &defaultAuthWebhookURL,
 		OrchWebhookURL: &defaultOrchWebhookURL,
 
-		// ** Pool Customization **
-		RemoteWorkerWebhookURL: &defaultRemoteWorkerWebhookURL,
-
 		// Versioning constraints
 		OrchMinLivepeerVersion: &defaultMinLivepeerVersion,
 
@@ -444,11 +442,16 @@ func DefaultLivepeerConfig() LivepeerConfig {
 		KafkaUsername:         &defaultKafkaUsername,
 		KafkaPassword:         &defaultKafkaPassword,
 		KafkaGatewayTopic:     &defaultKafkaGatewayTopic,
+
+		// ** Naap Customizations **
 		EventSinkURIs:          &defaultEventSinkURIs,
 		EventSinkHeaders:       &defaultEventSinkHeaders,
 		EventSinkQueueDepth:    &defaultEventSinkQueueDepth,
 		EventSinkBatchSize:     &defaultEventSinkBatchSize,
 		EventSinkFlushInterval: &defaultEventSinkFlushInterval,
+
+		// ** Pool Customization **
+		RemoteWorkerWebhookURL: &defaultRemoteWorkerWebhookURL,
 	}
 }
 
@@ -468,7 +471,8 @@ func (cfg LivepeerConfig) PrintConfig(w io.Writer) {
 		"MediaMTXApiPassword": true,
 		"LiveAIAuthApiKey":    true,
 		"FVfailGsKey":         true,
-		"EventSinkHeaders":    true,
+		// ** Naap Customizations **
+		"EventSinkHeaders": true,
 	}
 
 	for i := 0; i < cfgType.NumField(); i++ {
@@ -609,34 +613,11 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 	}
 	defer dbh.Close()
 
-	// ** Pool Customization **
-	// Create an instance of eventTracker
-	isNoop := (*cfg.Transcoder || *cfg.AIWorker)
-	isGateway := *cfg.Gateway
-	isOrchestrator := *cfg.Orchestrator
-	pool_ops, err := NewPoolTrackerOptionsFromEnv(isNoop)
-	if err != nil {
-		glog.Errorf("Error creating pool-enabled livepeer node: %v", err)
-	}
-	events.InitPoolTracker(pool_ops)
-	defer events.GlobalEventTracker.Stop()
-
 	n, err := core.NewLivepeerNode(nil, *cfg.Datadir, dbh)
 	if err != nil {
 		glog.Errorf("Error creating livepeer node: %v", err)
 	}
 	n.AIProcesssingRetryTimeout = *cfg.AIProcessingRetryTimeout
-
-	// ** Pool Customization **
-	//signal orchestrator was restarted
-	var nodeResetMsg = "node-reset"
-	if isGateway {
-		nodeResetMsg = "gateway-reset"
-	}
-	if isOrchestrator {
-		nodeResetMsg = "orchestrator-reset"
-	}
-	events.GlobalEventTracker.CreateEventLog(nodeResetMsg)
 
 	if *cfg.OrchSecret != "" {
 		n.OrchSecret, _ = common.ReadFromFile(*cfg.OrchSecret)
@@ -783,9 +764,31 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 
 	// Start event publisher
 	if *cfg.Monitor {
+		isGateway := *cfg.Gateway
+		isOrchestrator := *cfg.Orchestrator
+		isTranscoder := *cfg.Transcoder
+		isAiWorker := *cfg.AIWorker
+
+		//signal orchestrator was restarted
+		var nodeResetMsg = "node-reset"
+		if isGateway {
+			nodeResetMsg = "gateway-reset"
+		}
+		if isOrchestrator {
+			nodeResetMsg = "orchestrator-reset"
+		}
+		if isTranscoder {
+			nodeResetMsg = "transcoder-reset"
+		}
+		if isAiWorker {
+			nodeResetMsg = "ai-worker-reset"
+		}
+		glog.Infof("***Livepeer Start Event Publisher ***")
+		//TODO:NaaP Customization: is the event publisher required????
 		if err := startEventPublisher(cfg); err != nil {
 			exit("Error while starting event publisher", err)
 		}
+		lpmon.QueueEvent("node_trace", nodeResetMsg)
 	}
 
 	watcherErr := make(chan error)
@@ -1883,24 +1886,18 @@ func StartLivepeer(ctx context.Context, cfg LivepeerConfig) {
 			glog.Exit("Missing -orchAddr")
 		}
 		// ** Pool Customization **
-		// Pool: validate the orch URL
-		orchUri := ""
-		if len(orchURLs) > 0 {
-			orchUri = orchURLs[0].Host
+		// Pool: If present, add ETH Address to Remote Node
+		var ethAddr ethcommon.Address
+		if *cfg.EthAcctAddr != "" {
+			ethAddr = ethcommon.HexToAddress(*cfg.EthAcctAddr)
 		}
-
-		// Pool: Add ETH Address to Remote Node
-		if *cfg.EthAcctAddr == "" {
-			glog.Fatal("Starting a pool-based clients require an ethereum address, use '-ethAcctAddr'")
-		}
-		ethAddr := ethcommon.HexToAddress(*cfg.EthAcctAddr)
 
 		if n.NodeType == core.TranscoderNode {
-			go server.RunTranscoder(n, orchUri, core.MaxSessions, transcoderCaps, ethAddr)
+			go server.RunTranscoder(n, orchURLs[0].Host, core.MaxSessions, transcoderCaps, ethAddr)
 		}
 
 		if n.NodeType == core.AIWorkerNode {
-			go server.RunAIWorker(n, orchUri, n.Capabilities.ToNetCapabilities(), ethAddr)
+			go server.RunAIWorker(n, orchURLs[0].Host, n.Capabilities.ToNetCapabilities(), ethAddr)
 		}
 	}
 
@@ -2368,47 +2365,4 @@ func updatePerfScore(region string, respBody []byte, score *common.PerfScore) {
 func exit(msg string, args ...any) {
 	glog.Errorf(msg, args...)
 	os.Exit(2)
-}
-
-func NewPoolTrackerOptionsFromEnv(useNoop bool) (events.PoolTrackerOptions, error) {
-	opts := events.PoolTrackerOptions{
-		UseNoop:       useNoop,
-		Threshold:     10000,            // default
-		FlushInterval: 60 * time.Second, // default
-	}
-
-	if v := os.Getenv("POOL_EVENT_THRESHOLD"); v != "" {
-		t, err := strconv.Atoi(v)
-		if err != nil {
-			return opts, fmt.Errorf("invalid POOL_EVENT_THRESHOLD: %w", err)
-		}
-		opts.Threshold = t
-	}
-
-	if v := os.Getenv("POOL_FLUSH_INTERVAL_SECONDS"); v != "" {
-		sec, err := strconv.Atoi(v)
-		if err != nil {
-			return opts, fmt.Errorf("invalid POOL_FLUSH_INTERVAL_SECONDS: %w", err)
-		}
-		opts.FlushInterval = time.Duration(sec) * time.Second
-	}
-
-	// now pull in the required S3 vars
-	required := map[string]*string{
-		"POOL_S3_HOST":       &opts.S3Host,
-		"POOL_S3_BUCKET":     &opts.S3Bucket,
-		"POOL_S3_ACCESS_KEY": &opts.S3AccessKey,
-		"POOL_S3_SECRET_KEY": &opts.S3SecretKey,
-		"POOL_REGION":        &opts.Region,
-		"POOL_NODE_TYPE":     &opts.NodeType,
-	}
-	for env, ptr := range required {
-		if val := os.Getenv(env); val != "" {
-			*ptr = val
-		} else {
-			return opts, fmt.Errorf("missing %s", env)
-		}
-	}
-
-	return opts, nil
 }

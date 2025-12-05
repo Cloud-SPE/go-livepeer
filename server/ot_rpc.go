@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	ethcommon "github.com/ethereum/go-ethereum/common"
 	"io"
 	"io/ioutil"
 	"mime"
@@ -17,9 +16,12 @@ import (
 	"os/signal"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	ethcommon "github.com/ethereum/go-ethereum/common"
 
 	"github.com/cenkalti/backoff"
 	"github.com/golang/glog"
@@ -338,14 +340,18 @@ func (h *lphttp) RegisterTranscoder(req *net.RegisterRequest, stream net.Transco
 		req.Capabilities = core.NewCapabilities(core.DefaultCapabilities(), nil).ToNetCapabilities()
 	}
 	// ** Pool Customization **
-	// Pool:
-	if req.EthereumAddress == nil {
-		glog.Info(errNoEthAddress.Error())
-		return errNoEthAddress
+	addrStr := string(req.EthereumAddress)
+	addrStr = strings.ReplaceAll(addrStr, "\x00", "")
+	trimmedEthAddr := strings.TrimSpace(addrStr)
+	ethAddr := req.EthereumAddress
+	if trimmedEthAddr == "" /*|| trimmedEthAddr == "0x0000000000000000000000000000000000000000"*/ {
+		glog.Warning("remote worker connected with no eth address, will use the Orchestrator's address")
+		recipientAddress := ethcommon.HexToAddress(h.node.RecipientAddr)
+		ethAddr = recipientAddress.Bytes()
 	}
 	// blocks until stream is finished
 	// ** Pool Customization **
-	h.orchestrator.ServeTranscoder(stream, int(req.Capacity), req.Capabilities, ethcommon.BytesToAddress(req.EthereumAddress))
+	h.orchestrator.ServeTranscoder(stream, int(req.Capacity), req.Capabilities, ethcommon.BytesToAddress(ethAddr))
 	return nil
 }
 

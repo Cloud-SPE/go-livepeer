@@ -13,6 +13,13 @@ import (
 	"github.com/google/uuid"
 )
 
+type EventPair struct {
+	Name  string
+	Value interface{}
+}
+
+type EventData map[string]interface{}
+
 type EventEnvelope struct {
 	ID        string          `json:"id"`
 	Type      string          `json:"type"`

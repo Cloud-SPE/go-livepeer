@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"golang.org/x/net/websocket"
@@ -17,6 +18,9 @@ type websocketBackend struct {
 	origin  string
 	headers http.Header
 	timeout time.Duration
+
+	mu   sync.Mutex
+	conn *websocket.Conn
 }
 
 func init() {
@@ -59,20 +63,7 @@ func newWebSocketBackend(u *url.URL, opts BackendOptions) (EventBackend, error) 
 	}, nil
 }
 
-func (b *websocketBackend) Start(_ context.Context) error {
-	return nil
-}
-
-func (b *websocketBackend) Publish(ctx context.Context, batch []EventEnvelope) error {
-	if len(batch) == 0 {
-		return nil
-	}
-
-	payload, err := json.Marshal(batch)
-	if err != nil {
-		return err
-	}
-
+func (b *websocketBackend) Start(ctx context.Context) error {
 	cfg, err := websocket.NewConfig(b.target, b.origin)
 	if err != nil {
 		return err
@@ -89,11 +80,42 @@ func (b *websocketBackend) Publish(ctx context.Context, batch []EventEnvelope) e
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
 
-	return websocket.Message.Send(conn, payload)
+	b.mu.Lock()
+	b.conn = conn
+	b.mu.Unlock()
+
+	return nil
+}
+
+func (b *websocketBackend) Publish(_ context.Context, batch []EventEnvelope) error {
+	if len(batch) == 0 {
+		return nil
+	}
+
+	payload, err := json.Marshal(batch)
+	if err != nil {
+		return err
+	}
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.conn == nil {
+		return fmt.Errorf("websocket connection not initialized")
+	}
+
+	return websocket.Message.Send(b.conn, payload)
 }
 
 func (b *websocketBackend) Stop(_ context.Context) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if b.conn != nil {
+		err := b.conn.Close()
+		b.conn = nil
+		return err
+	}
 	return nil
 }

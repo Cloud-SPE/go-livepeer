@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/livepeer/go-livepeer/events"
 	"math/big"
 	"net/http"
 	"net/url"
@@ -18,6 +17,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	lpmon "github.com/livepeer/go-livepeer/monitor"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -151,8 +152,16 @@ func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerSer
 	}()
 
 	// ** Pool Customization **
-	ethAddrStr := ethereumAddr.String()
-	events.GlobalEventTracker.CreateEventLog("worker-connected", "ethAddress", ethAddrStr, "connection", from)
+	if lpmon.Enabled {
+		ethAddrStr := ethereumAddr.String()
+
+		evt := lpmon.EventData{
+			"ethAddress": ethAddrStr,
+			"connection": from,
+		}
+
+		lpmon.QueueEvent("worker-connected", evt)
+	}
 	rwm.RWmutex.Lock()
 	rwm.liveAIWorkers[aiworker.stream] = aiworker
 	rwm.remoteAIWorkers = append(rwm.remoteAIWorkers, aiworker)
@@ -161,7 +170,14 @@ func (rwm *RemoteAIWorkerManager) Manage(stream net.AIWorker_RegisterAIWorkerSer
 	<-aiworker.eof
 	glog.Infof("Got aiworker=%s eof, removing from live aiworkers map", from)
 	// ** Pool Customization **
-	events.GlobalEventTracker.CreateEventLog("worker-disconnected", "ethAddress", ethAddrStr, "connection", from)
+	if lpmon.Enabled {
+		ethAddrStr := ethereumAddr.String()
+		evt := lpmon.EventData{
+			"ethAddress": ethAddrStr,
+			"connection": from,
+		}
+		lpmon.QueueEvent("worker-disconnected", evt)
+	}
 	rwm.RWmutex.Lock()
 	delete(rwm.liveAIWorkers, aiworker.stream)
 	rwm.RWmutex.Unlock()
@@ -472,14 +488,20 @@ func (rw *RemoteAIWorker) Process(logCtx context.Context, requestID string, pipe
 		return signalEOF(ErrRemoteWorkerTimeout)
 	case chanData := <-taskChan:
 		// ** Pool Customization **
-		// Pool: make sure Jobs have ETH Address of Remote AI Worker
-		ethAddress := rw.ethereumAddress.String()
-		events.GlobalEventTracker.CreateEventLog("job-received", "ethAddress", ethAddress, "requestID", requestID, "pipeline", pipeline, "modelID", modelID)
+		if lpmon.Enabled {
+			// Pool: make sure Jobs have ETH Address of Remote AI Worker
+			ethAddress := rw.ethereumAddress.String()
+			evt := lpmon.EventData{
+				"ethAddress": ethAddress,
+				"requestID":  requestID,
+				"pipeline":   pipeline,
+				"modelID":    modelID,
+			}
 
-		clog.InfofErr(logCtx, "Successfully received results from remote worker=%s ethAddress=%s taskId=%d pipeline=%s model_id=%s dur=%v",
-			rw.addr, ethAddress, taskID, pipeline, modelID, time.Since(start), chanData.Err)
+			lpmon.QueueEvent("job-received", evt)
+			clog.InfofErr(logCtx, "Successfully received results from remote worker=%s ethAddress=%s taskId=%d pipeline=%s model_id=%s dur=%v",
+				rw.addr, ethAddress, taskID, pipeline, modelID, time.Since(start), chanData.Err)
 
-		if monitor.Enabled {
 			monitor.AIResultDownloaded(logCtx, pipeline, modelID, chanData.DownloadTime)
 		}
 

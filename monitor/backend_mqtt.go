@@ -105,12 +105,7 @@ func (b *mqttBackend) Publish(ctx context.Context, batch []EventEnvelope) error 
 	if len(batch) == 0 {
 		return nil
 	}
-
-	payload, err := json.Marshal(batch)
-	if err != nil {
-		return err
-	}
-
+	var err error
 	dialer := &net.Dialer{Timeout: b.timeout}
 	if deadline, ok := ctx.Deadline(); ok {
 		dialer.Deadline = deadline
@@ -137,9 +132,15 @@ func (b *mqttBackend) Publish(ctx context.Context, batch []EventEnvelope) error 
 	if err := awaitConnAck(conn, b.timeout); err != nil {
 		return err
 	}
+	for _, evt := range batch {
+		pt, err := json.Marshal(evt)
 
-	if err := sendPublishPacket(conn, b.topic, payload, b.qos, b.retain); err != nil {
-		return err
+		if err != nil {
+			return err
+		}
+		if err := sendPublishPacket(conn, b.topic, pt, b.qos, b.retain); err != nil {
+			return err
+		}
 	}
 
 	sendDisconnectPacket(conn)

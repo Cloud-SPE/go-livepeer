@@ -8,7 +8,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/livepeer/go-livepeer/events"
 	"image"
 	"io"
 	"log/slog"
@@ -583,10 +582,19 @@ func handleAIRequest(ctx context.Context, w http.ResponseWriter, r *http.Request
 	pricePerComputeUnit := payment.GetExpectedPrice().GetPricePerUnit() / payment.GetExpectedPrice().GetPixelsPerUnit()
 	fees := pricePerComputeUnit * outPixels
 
-	// Log event with calculated price and fees
-	events.GlobalEventTracker.CreateEventLog("job-processed", "requestID", requestID, "pipeline", pipeline, "modelID", modelID, "responseTime", took, "computeUnits", outPixels, "pricePerComputeUnit", pricePerComputeUnit, "fees", fees)
-
 	if monitor.Enabled {
+		// Log event with calculated price and fees
+		evt := monitor.EventData{
+			"requestID":           requestID,
+			"pipeline":            pipeline,
+			"modelID":             modelID,
+			"responseTime":        took,
+			"computeUnits":        outPixels,
+			"pricePerComputeUnit": pricePerComputeUnit,
+			"fees":                fees,
+		}
+
+		monitor.QueueEvent("job-processed", evt)
 		var latencyScore float64
 		switch v := req.(type) {
 		case worker.GenTextToImageJSONRequestBody:
