@@ -351,7 +351,7 @@ func (n *LivepeerNode) UpdateNetworkCapabilities(orchNetworkCapabilities []*comm
 	n.NetworkCapabilities.Orchestrators = orchNetworkCapabilities
 
 	if lpmon.Enabled {
-		lpmon.SendQueueEventAsync("network_capabilities", orchNetworkCapabilities)
+		lpmon.EmitQueueEvent(lpmon.KafkaTopicNetworkCaps, orchNetworkCapabilities)
 	}
 
 	return nil

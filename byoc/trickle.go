@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -85,10 +84,17 @@ func (bsg *BYOCGatewayServer) startTricklePublish(ctx context.Context, url *url.
 		}
 		thisSeq, atMax := slowOrchChecker.BeginSegment()
 		if atMax {
+			suspendErr := errors.New("orchestrator is slow")
 			clog.Infof(ctx, "Orchestrator is slow - terminating")
+			emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+				Type:      monitor.AIStreamEventTypeSuspend,
+				ErrorType: monitor.AIStreamErrorTypeSlowOrchestrator,
+				Message:   suspendErr.Error(),
+				Stage:     "publish",
+			})
 			bsg.suspendOrchestrator(ctx, params)
 			cancel()
-			stopProcessing(ctx, params, errors.New("orchestrator is slow"))
+			stopProcessing(ctx, params, suspendErr)
 			return
 		}
 		go func(seq int) {
@@ -130,15 +136,14 @@ func (bsg *BYOCGatewayServer) startTricklePublish(ctx context.Context, url *url.
 					// no error, all done, let's leave
 					if monitor.Enabled && firstSegment {
 						firstSegment = false
-						monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-							"type":        "gateway_send_first_ingest_segment",
-							"timestamp":   time.Now().UnixMilli(),
-							"stream_id":   params.liveParams.streamID,
-							"pipeline_id": params.liveParams.pipelineID,
-							"request_id":  params.liveParams.requestID,
-							"orchestrator_info": map[string]interface{}{
-								"address": orchAddr,
-								"url":     orchUrl,
+						monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+							Type:       monitor.StreamTraceGatewaySendFirstIngestSegment,
+							StreamID:   params.liveParams.streamID,
+							PipelineID: params.liveParams.pipelineID,
+							RequestID:  params.liveParams.requestID,
+							OrchestratorInfo: monitor.OrchestratorInfo{
+								Address: orchAddr,
+								URL:     orchUrl,
 							},
 						})
 					}
@@ -281,8 +286,15 @@ func (bsg *BYOCGatewayServer) startTrickleSubscribe(ctx context.Context, url *ur
 				maxSegmentDelay := params.liveParams.outSegmentTimeout / 2
 				if segmentAge < maxSegmentDelay && bsg.streamPipelineExists(params.liveParams.streamID) {
 					// we have some recent input but no output from orch, so kick
+					suspendErr := fmt.Errorf("trickle subscribe error, swapping: %w", err)
+					emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeSuspend,
+						ErrorType: monitor.AIStreamErrorTypeSubscribeError,
+						Message:   suspendErr.Error(),
+						Stage:     "subscribe",
+					})
 					bsg.suspendOrchestrator(ctx, params)
-					stopProcessing(ctx, params, fmt.Errorf("trickle subscribe error, swapping: %w", err))
+					stopProcessing(ctx, params, suspendErr)
 					return
 				}
 				clog.InfofErr(ctx, "trickle subscribe error copying segment seq=%d", seq, err)
@@ -295,15 +307,14 @@ func (bsg *BYOCGatewayServer) startTrickleSubscribe(ctx context.Context, url *ur
 				delayMs := time.Since(params.liveParams.startTime).Milliseconds()
 				if monitor.Enabled {
 					//monitor.AIFirstSegmentDelay(delayMs, params.liveParams.sess.OrchestratorInfo)
-					monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-						"type":        "gateway_receive_first_processed_segment",
-						"timestamp":   time.Now().UnixMilli(),
-						"stream_id":   params.liveParams.streamID,
-						"pipeline_id": params.liveParams.pipelineID,
-						"request_id":  params.liveParams.requestID,
-						"orchestrator_info": map[string]interface{}{
-							"address": orchAddr,
-							"url":     orchUrl,
+					monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+						Type:       monitor.StreamTraceGatewayRecvFirstProcSegment,
+						StreamID:   params.liveParams.streamID,
+						PipelineID: params.liveParams.pipelineID,
+						RequestID:  params.liveParams.requestID,
+						OrchestratorInfo: monitor.OrchestratorInfo{
+							Address: orchAddr,
+							URL:     orchUrl,
 						},
 					})
 				}
@@ -313,15 +324,14 @@ func (bsg *BYOCGatewayServer) startTrickleSubscribe(ctx context.Context, url *ur
 			if segmentsReceived == 3 && monitor.Enabled {
 				// We assume that after receiving 3 segments, the runner started successfully
 				// and we should be able to start the playback
-				monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-					"type":        "gateway_receive_few_processed_segments",
-					"timestamp":   time.Now().UnixMilli(),
-					"stream_id":   params.liveParams.streamID,
-					"pipeline_id": params.liveParams.pipelineID,
-					"request_id":  params.liveParams.requestID,
-					"orchestrator_info": map[string]interface{}{
-						"address": orchAddr,
-						"url":     orchUrl,
+				monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+					Type:       monitor.StreamTraceGatewayRecvFewProcSegments,
+					StreamID:   params.liveParams.streamID,
+					PipelineID: params.liveParams.pipelineID,
+					RequestID:  params.liveParams.requestID,
+					OrchestratorInfo: monitor.OrchestratorInfo{
+						Address: orchAddr,
+						URL:     orchUrl,
 					},
 				})
 
@@ -345,8 +355,15 @@ func (bsg *BYOCGatewayServer) startTrickleSubscribe(ctx context.Context, url *ur
 				hasRecentInput := lastInputSegmentAge < segmentTimeout/2
 				if hasRecentInput && bsg.streamPipelineExists(params.liveParams.streamID) {
 					// abandon the orchestrator
+					timeoutErr := fmt.Errorf("timeout waiting for segments")
+					emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeError,
+						ErrorType: monitor.AIStreamErrorTypeNetworkTimeout,
+						Message:   timeoutErr.Error(),
+						Stage:     "subscribe",
+					})
 					bsg.suspendOrchestrator(ctx, params)
-					stopProcessing(ctx, params, fmt.Errorf("timeout waiting for segments"))
+					stopProcessing(ctx, params, timeoutErr)
 					segmentTicker.Stop()
 					return
 				}
@@ -489,7 +506,7 @@ func (bsg *BYOCGatewayServer) startControlPublish(ctx context.Context, control *
 
 	reportUpdate := func(data []byte) {
 		// send the param update to kafka
-		monitor.SendQueueEventAsync("ai_stream_events", map[string]interface{}{
+		monitor.EmitQueueEvent(monitor.KafkaTopicAIStreamEvents, map[string]interface{}{
 			"type":        "params_update",
 			"stream_id":   params.liveParams.streamID,
 			"request_id":  params.liveParams.requestID,
@@ -692,7 +709,7 @@ func (bsg *BYOCGatewayServer) startEventsSubscribe(
 					clog.Infof(ctx, "Failed to parse JSON as direct event: %s", err)
 					continue
 				}
-				queueEventType = "ai_stream_events"
+				queueEventType = string(monitor.KafkaTopicAIStreamEvents)
 			}
 
 			event["stream_id"] = streamId
@@ -717,6 +734,23 @@ func (bsg *BYOCGatewayServer) startEventsSubscribe(
 				clog.Warningf(ctx, "Received event without a type stream=%s event=%+v",
 					streamId, event,
 				)
+			}
+			if eventType == "error" {
+				errorMessage := monitor.FirstNonEmpty(
+					monitor.MapStringValue(event, "message"),
+					"orchestrator inference failure",
+				)
+				emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+					Type:                monitor.AIStreamEventTypeError,
+					ErrorType:           monitor.AIStreamErrorTypeOrchestratorInferenceFailure,
+					Message:             errorMessage,
+					OrchestratorAddress: monitor.FirstNonEmpty(monitor.MapStringValue(event, "orchestrator_address"), orchAddr),
+					OrchestratorURL:     monitor.FirstNonEmpty(monitor.MapStringValue(event, "orchestrator_url"), orchUrl),
+					GPUID:               monitor.MapStringValue(event, "gpu_id"),
+					ModelID:             monitor.FirstNonEmpty(monitor.MapStringValue(event, "model_id"), params.liveParams.pipeline),
+					Stage:               "events_subscribe",
+				})
+				continue
 			}
 
 			if eventType == "status" {
@@ -744,7 +778,7 @@ func (bsg *BYOCGatewayServer) startEventsSubscribe(
 				bsg.statusStore.Store(streamId, event)
 			}
 
-			monitor.SendQueueEventAsync(queueEventType, event)
+			monitor.EmitQueueEvent(monitor.KafkaTopic(queueEventType), event)
 		}
 	}()
 
@@ -762,7 +796,14 @@ func (bsg *BYOCGatewayServer) startEventsSubscribe(
 				lastEventMu.Unlock()
 
 				if time.Since(eventTime) > maxEventGap {
-					stopProcessing(ctx, params, fmt.Errorf("timeout waiting for events"))
+					timeoutErr := fmt.Errorf("timeout waiting for events")
+					emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeError,
+						ErrorType: monitor.AIStreamErrorTypeNetworkTimeout,
+						Message:   timeoutErr.Error(),
+						Stage:     "events_subscribe",
+					})
+					stopProcessing(ctx, params, timeoutErr)
 					return
 				}
 			}
@@ -890,15 +931,14 @@ func (bsg *BYOCGatewayServer) startDataSubscribe(ctx context.Context, url *url.U
 				firstSegment = false
 				delayMs := time.Since(params.liveParams.startTime).Milliseconds()
 				if monitor.Enabled {
-					monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-						"type":        "gateway_receive_first_data_segment",
-						"timestamp":   time.Now().UnixMilli(),
-						"stream_id":   params.liveParams.streamID,
-						"pipeline_id": params.liveParams.pipelineID,
-						"request_id":  params.liveParams.requestID,
-						"orchestrator_info": map[string]interface{}{
-							"address": orchAddr,
-							"url":     orchUrl,
+					monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+						Type:       monitor.StreamTraceGatewayRecvFirstDataSegment,
+						StreamID:   params.liveParams.streamID,
+						PipelineID: params.liveParams.pipelineID,
+						RequestID:  params.liveParams.requestID,
+						OrchestratorInfo: monitor.OrchestratorInfo{
+							Address: orchAddr,
+							URL:     orchUrl,
 						},
 					})
 				}
@@ -911,18 +951,59 @@ func (bsg *BYOCGatewayServer) startDataSubscribe(ctx context.Context, url *url.U
 	}()
 }
 
-func (bs *BYOCGatewayServer) LiveErrorEventSender(ctx context.Context, streamID string, event map[string]string) func(err error) {
+func (bs *BYOCGatewayServer) LiveErrorEventSender(ctx context.Context, params *byocLiveRequestParams) func(err error) {
 	return func(err error) {
-		bs.statusStore.StoreIfNotExists(streamID, "error", map[string]interface{}{
-			"error_message": err.Error(),
-			"error_time":    time.Now().UnixMilli(),
+		if err == nil || params == nil {
+			return
+		}
+		bs.statusStore.StoreIfNotExists(params.streamID, "error", map[string]interface{}{
+			"message":    err.Error(),
+			"error_time": time.Now().UnixMilli(),
 		})
-
-		ev := maps.Clone(event)
-		ev["capability"] = clog.GetVal(ctx, "capability")
-		ev["message"] = err.Error()
-		monitor.SendQueueEventAsync("ai_stream_events", ev)
+		emitByocIssueEvent(ctx, params, monitor.AIStreamIssueEvent{
+			Type:      monitor.AIStreamEventTypeError,
+			ErrorType: monitor.AIStreamErrorTypeGatewayError,
+			Message:   err.Error(),
+			Stage:     "gateway",
+		})
 	}
+}
+
+func emitByocIssueEvent(ctx context.Context, params *byocLiveRequestParams, ev monitor.AIStreamIssueEvent) {
+	if params == nil {
+		return
+	}
+	if ev.StreamID == "" {
+		ev.StreamID = params.streamID
+	}
+	if ev.Pipeline == "" {
+		ev.Pipeline = params.pipeline
+	}
+	if ev.PipelineID == "" {
+		ev.PipelineID = params.pipelineID
+	}
+	if ev.RequestID == "" {
+		ev.RequestID = params.requestID
+	}
+	if ev.ModelID == "" {
+		ev.ModelID = params.pipeline
+	}
+	if ev.OrchestratorAddress == "" {
+		ev.OrchestratorAddress = params.orchToken.Address()
+	}
+	if ev.OrchestratorURL == "" {
+		ev.OrchestratorURL = params.orchToken.URL()
+	}
+	if ev.OrchestratorInfo == nil && ev.OrchestratorAddress != "" {
+		ev.OrchestratorInfo = map[string]interface{}{
+			"address": ev.OrchestratorAddress,
+			"url":     ev.OrchestratorURL,
+		}
+	}
+	if ev.Capability == nil {
+		ev.Capability = clog.GetVal(ctx, "capability")
+	}
+	monitor.EmitAIStreamIssueEvent(ev)
 }
 
 func logToDisk(ctx context.Context, r media.CloneableReader, workdir string, requestID, manifestID string, seq int) {

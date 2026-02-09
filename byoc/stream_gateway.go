@@ -176,6 +176,19 @@ func (bsg *BYOCGatewayServer) runStream(gatewayJob *gatewayJob) {
 	firstProcessed := false
 	lastSwap := time.Now()
 	swapCnt := 0
+	type pendingSwapEvent struct {
+		// firstSwapReason is the original trigger for the swap and should remain immutable
+		// while we try different replacement orchestrators.
+		firstSwapReason string
+		// lastSwapReason tracks the most recent replacement-attempt failure.
+		// This gives operators the latest actionable failure without losing the original trigger.
+		lastSwapReason      string
+		oldOrchestratorAddr string
+		oldOrchestratorURL  string
+	}
+	// We track swaps in a pending struct so we can capture both the previous
+	// and newly selected orchestrator in a single event once replacement succeeds.
+	var pendingSwap *pendingSwapEvent
 	for _, orch := range gatewayJob.Orchs {
 		clog.Infof(ctx, "Starting stream processing")
 		//refresh the token if not first Orch to confirm capacity and new ticket params
@@ -203,6 +216,27 @@ func (bsg *BYOCGatewayServer) runStream(gatewayJob *gatewayJob) {
 		streamReq := bsg.streamPipelineRequest(streamID)
 
 		orchResp, _, err := bsg.sendJobToOrch(ctx, nil, gatewayJob.Job.Req, gatewayJob.SignedJobReq, orch, "/ai/stream/start", streamReq)
+		if pendingSwap != nil {
+			event := monitor.AIStreamIssueEvent{
+				OldOrchestratorAddress: pendingSwap.oldOrchestratorAddr,
+				OldOrchestratorURL:     pendingSwap.oldOrchestratorURL,
+				SwapReason:             pendingSwap.firstSwapReason,
+				Stage:                  "swap",
+			}
+			if err != nil {
+				// Keep trying other orchestrators; only emit swap_failed if no replacement
+				// can be selected by the end of the loop.
+				pendingSwap.lastSwapReason = err.Error()
+			} else {
+				event.Type = monitor.AIStreamEventTypeSwap
+				event.ErrorType = monitor.AIStreamErrorTypeOrchestratorSwap
+				event.Message = pendingSwap.firstSwapReason
+				event.NewOrchestratorAddress = orch.Address()
+				event.NewOrchestratorURL = orch.URL()
+				emitByocIssueEvent(ctx, params.liveParams, event)
+				pendingSwap = nil
+			}
+		}
 		if err != nil {
 			clog.Errorf(ctx, "job not able to be processed by Orchestrator %v err=%v ", orch.ServiceAddr, err.Error())
 			continue
@@ -262,21 +296,35 @@ func (bsg *BYOCGatewayServer) runStream(gatewayJob *gatewayJob) {
 		if err == nil {
 			err = errors.New("unknown swap reason")
 		}
-		// report the swap
-		monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-			"type":        "orchestrator_swap",
-			"stream_id":   params.liveParams.streamID,
-			"request_id":  params.liveParams.requestID,
-			"pipeline":    params.liveParams.pipeline,
-			"pipeline_id": params.liveParams.pipelineID,
-			"message":     err.Error(),
-			"orchestrator_info": map[string]interface{}{
-				"address": params.liveParams.orchToken.Address(),
-				"url":     params.liveParams.orchToken.URL(),
-			},
-		})
-
+		pendingSwap = &pendingSwapEvent{
+			firstSwapReason:     err.Error(),
+			oldOrchestratorAddr: orch.Address(),
+			oldOrchestratorURL:  orch.URL(),
+		}
 		clog.Infof(ctx, "Retrying stream with a different orchestrator err=%v", err.Error())
+	}
+	if pendingSwap != nil {
+		// If we get here, we just swapped but ran into issues selecting a replacement orch.
+		errorMessage := "failed selecting replacement orchestrator: exhausted orchestrator list"
+		if pendingSwap.lastSwapReason != "" {
+			errorMessage = fmt.Sprintf(
+				"%s (first_swap_reason=%s; last_attempt_reason=%s)",
+				errorMessage,
+				pendingSwap.firstSwapReason,
+				pendingSwap.lastSwapReason,
+			)
+		} else if pendingSwap.firstSwapReason != "" {
+			errorMessage = fmt.Sprintf("%s (first_swap_reason=%s)", errorMessage, pendingSwap.firstSwapReason)
+		}
+		emitByocIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+			Type:                   monitor.AIStreamEventTypeSwapFailed,
+			ErrorType:              monitor.AIStreamErrorTypeOrchestratorSwapFailed,
+			Message:                errorMessage,
+			OldOrchestratorAddress: pendingSwap.oldOrchestratorAddr,
+			OldOrchestratorURL:     pendingSwap.oldOrchestratorURL,
+			SwapReason:             pendingSwap.firstSwapReason,
+			Stage:                  "swap",
+		})
 	}
 
 	//if there is ingress input then force off
@@ -584,16 +632,12 @@ func (bsg *BYOCGatewayServer) setupStream(ctx context.Context, r *http.Request, 
 	bsg.statusStore.Clear(streamID)
 	bsg.statusStore.StoreKey(streamID, "whep_url", whepURL)
 
-	monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-		"type":        "gateway_receive_stream_request",
-		"timestamp":   streamRequestTime,
-		"stream_id":   streamID,
-		"pipeline_id": pipelineID,
-		"request_id":  requestID,
-		"orchestrator_info": map[string]interface{}{
-			"address": "",
-			"url":     "",
-		},
+	monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+		Type:       monitor.StreamTraceGatewayReceiveStreamRequest,
+		Timestamp:  streamRequestTime,
+		StreamID:   streamID,
+		PipelineID: pipelineID,
+		RequestID:  requestID,
 	})
 
 	// Count `ai_live_attempts` after successful parameters validation
@@ -602,13 +646,7 @@ func (bsg *BYOCGatewayServer) setupStream(ctx context.Context, r *http.Request, 
 		monitor.AILiveVideoAttempt(job.Job.Req.Capability)
 	}
 
-	sendErrorEvent := bsg.LiveErrorEventSender(ctx, streamID, map[string]string{
-		"type":        "error",
-		"request_id":  requestID,
-		"stream_id":   streamID,
-		"pipeline_id": pipelineID,
-		"pipeline":    pipeline,
-	})
+	var sendErrorEvent func(err error)
 
 	inputStreamExists := func(streamId string) bool {
 		return bsg.streamPipelineExists(streamId)
@@ -642,6 +680,8 @@ func (bsg *BYOCGatewayServer) setupStream(ctx context.Context, r *http.Request, 
 			manifestID: pipeline, //byoc uses one balance per capability name
 		},
 	}
+	sendErrorEvent = bsg.LiveErrorEventSender(ctx, params.liveParams)
+	params.liveParams.sendErrorEvent = sendErrorEvent
 
 	//create a dataWriter for data channel if enabled
 	if job.Job.Params.EnableDataOutput {
@@ -753,16 +793,12 @@ func (bsg *BYOCGatewayServer) StartStreamRTMPIngest() http.Handler {
 			ms.RunSegmentation(segmenterCtx, stream.streamParams.liveParams.localRTMPPrefix, stream.streamParams.liveParams.segmentReader.Read)
 
 			stream.streamParams.liveParams.sendErrorEvent(errors.New("mediamtx ingest disconnected"))
-			monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-				"type":        "gateway_ingest_stream_closed",
-				"timestamp":   time.Now().UnixMilli(),
-				"stream_id":   stream.streamParams.liveParams.streamID,
-				"pipeline_id": stream.streamParams.liveParams.pipelineID,
-				"request_id":  stream.streamParams.liveParams.requestID,
-				"orchestrator_info": map[string]interface{}{
-					"address": "",
-					"url":     "",
-				},
+			monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+				Type:       monitor.StreamTraceGatewayIngestStreamClosed,
+				Timestamp:  time.Now().UnixMilli(),
+				StreamID:   stream.streamParams.liveParams.streamID,
+				PipelineID: stream.streamParams.liveParams.pipelineID,
+				RequestID:  stream.streamParams.liveParams.requestID,
 			})
 			stream.streamParams.liveParams.segmentReader.Close()
 
@@ -1114,7 +1150,7 @@ func (bsg *BYOCGatewayServer) runStats(ctx context.Context, whipConn *media.WHIP
 				"stats": stats,
 			})
 
-			monitor.SendQueueEventAsync("stream_ingest_metrics", map[string]interface{}{
+			monitor.EmitQueueEvent(monitor.KafkaTopicStreamIngestMets, map[string]interface{}{
 				"timestamp":   time.Now().UnixMilli(),
 				"stream_id":   streamID,
 				"pipeline_id": pipelineID,

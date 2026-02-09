@@ -585,29 +585,33 @@ func (ls *LivepeerServer) StartLiveVideo() http.Handler {
 		GatewayStatus.Clear(streamID)
 		GatewayStatus.StoreKey(streamID, "whep_url", whepURL)
 
-		monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-			"type":        "gateway_receive_stream_request",
-			"timestamp":   streamRequestTime,
-			"stream_id":   streamID,
-			"pipeline_id": pipelineID,
-			"request_id":  requestID,
-			"orchestrator_info": map[string]interface{}{
-				"address": "",
-				"url":     "",
-			},
+		monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+			Type:       monitor.StreamTraceGatewayReceiveStreamRequest,
+			Timestamp:  streamRequestTime,
+			StreamID:   streamID,
+			PipelineID: pipelineID,
+			RequestID:  requestID,
 		})
 
 		// Count `ai_live_attempts` after successful parameters validation
 		clog.V(common.VERBOSE).Infof(ctx, "AI Live video attempt")
 		monitor.AILiveVideoAttempt(pipeline) // this `pipeline` is actually modelID
 
-		sendErrorEvent := LiveErrorEventSender(ctx, streamID, map[string]string{
-			"type":        "error",
-			"request_id":  requestID,
-			"stream_id":   streamID,
-			"pipeline_id": pipelineID,
-			"pipeline":    pipeline,
-		})
+		ssr := media.NewSwitchableSegmentReader()
+		liveParams := &liveRequestParams{
+			segmentReader:          ssr,
+			rtmpOutputs:            rtmpOutputs,
+			localRTMPPrefix:        mediaMTXInputURL,
+			stream:                 streamName,
+			paymentProcessInterval: ls.livePaymentInterval,
+			outSegmentTimeout:      ls.outSegmentTimeout,
+			requestID:              requestID,
+			streamID:               streamID,
+			pipelineID:             pipelineID,
+			pipeline:               pipeline,
+			orchestrator:           orchestrator,
+		}
+		sendErrorEvent := LiveErrorEventSender(ctx, liveParams)
 
 		// this function is called when the pipeline hits a fatal error, we kick the input connection to allow
 		// the client to reconnect and restart the pipeline
@@ -626,28 +630,14 @@ func (ls *LivepeerServer) StartLiveVideo() http.Handler {
 				clog.Errorf(ctx, "Failed to kick input connection: %s", err)
 			}
 		}
+		liveParams.sendErrorEvent = sendErrorEvent
+		liveParams.kickInput = kickInput
 
-		ssr := media.NewSwitchableSegmentReader()
 		params := aiRequestParams{
 			node:        ls.LivepeerNode,
 			os:          drivers.NodeStorage.NewSession(requestID),
 			sessManager: ls.AISessionManager,
-
-			liveParams: &liveRequestParams{
-				segmentReader:          ssr,
-				rtmpOutputs:            rtmpOutputs,
-				localRTMPPrefix:        mediaMTXInputURL,
-				stream:                 streamName,
-				paymentProcessInterval: ls.livePaymentInterval,
-				outSegmentTimeout:      ls.outSegmentTimeout,
-				requestID:              requestID,
-				streamID:               streamID,
-				pipelineID:             pipelineID,
-				pipeline:               pipeline,
-				kickInput:              kickInput,
-				sendErrorEvent:         sendErrorEvent,
-				orchestrator:           orchestrator,
-			},
+			liveParams:  liveParams,
 		}
 
 		registerControl(ctx, params)
@@ -660,16 +650,11 @@ func (ls *LivepeerServer) StartLiveVideo() http.Handler {
 			ms := media.MediaSegmenter{Workdir: ls.LivepeerNode.WorkDir, MediaMTXClient: mediaMTXClient}
 			ms.RunSegmentation(segmenterCtx, mediaMTXInputURL, ssr.Read)
 			sendErrorEvent(errors.New("mediamtx ingest disconnected"))
-			monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-				"type":        "gateway_ingest_stream_closed",
-				"timestamp":   time.Now().UnixMilli(),
-				"stream_id":   streamID,
-				"pipeline_id": pipelineID,
-				"request_id":  requestID,
-				"orchestrator_info": map[string]interface{}{
-					"address": "",
-					"url":     "",
-				},
+			monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+				Type:       monitor.StreamTraceGatewayIngestStreamClosed,
+				StreamID:   streamID,
+				PipelineID: pipelineID,
+				RequestID:  requestID,
 			})
 			<-orchSelection // wait for selection to complete
 			cleanupControl(ctx, params)
@@ -692,13 +677,46 @@ func processStream(ctx context.Context, params aiRequestParams, req worker.GenLi
 	orchSwapper := NewOrchestratorSwapper(params)
 	isFirst, firstProcessed := true, make(chan interface{})
 	go func() {
+		type pendingSwapEvent struct {
+			// firstSwapReason is the original trigger for the swap and should remain immutable
+			// while we try different replacement orchestrators.
+			firstSwapReason string
+			// lastSwapReason tracks the most recent replacement-attempt failure.
+			// This gives operators the latest actionable failure without losing the original trigger.
+			lastSwapReason      string
+			oldOrchestratorAddr string
+			oldOrchestratorURL  string
+		}
+
+		//we track swaps in a pending struct so that we can capture both the current orch and the newly select orch in the event
+		var pendingSwap *pendingSwapEvent
 		var err error
 		for {
 			perOrchCtx, perOrchCancel := context.WithCancelCause(ctx)
 			params.liveParams = newLiveParams(params, perOrchCancel)
 			var resp interface{}
 			resp, err = processAIRequest(perOrchCtx, params, req)
+			if pendingSwap != nil && err == nil {
+				// if we get here, the swap was successful
+				event := monitor.AIStreamIssueEvent{
+					OldOrchestratorAddress: pendingSwap.oldOrchestratorAddr,
+					OldOrchestratorURL:     pendingSwap.oldOrchestratorURL,
+					SwapReason:             pendingSwap.firstSwapReason,
+					Stage:                  "swap",
+				}
+				event.Type = monitor.AIStreamEventTypeSwap
+				event.ErrorType = monitor.AIStreamErrorTypeOrchestratorSwap
+				event.Message = pendingSwap.firstSwapReason
+				event.NewOrchestratorAddress = liveOrchestratorAddress(params.liveParams)
+				event.NewOrchestratorURL = liveOrchestratorURL(params.liveParams)
+				emitLiveIssueEvent(ctx, params.liveParams, event)
+				pendingSwap = nil
+			}
 			if err != nil {
+				if pendingSwap != nil {
+					// processAIRequest exhausted selection/retry attempts for this swap.
+					pendingSwap.lastSwapReason = err.Error()
+				}
 				clog.Errorf(ctx, "Error processing AI Request: %s", err)
 				perOrchCancel(err)
 				break
@@ -738,18 +756,32 @@ func processStream(ctx context.Context, params aiRequestParams, req worker.GenLi
 			if err == nil {
 				err = errors.New("unknown swap reason")
 			}
-			// report the swap
-			monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-				"type":        "orchestrator_swap",
-				"stream_id":   params.liveParams.streamID,
-				"request_id":  params.liveParams.requestID,
-				"pipeline":    params.liveParams.pipeline,
-				"pipeline_id": params.liveParams.pipelineID,
-				"message":     err.Error(),
-				"orchestrator_info": map[string]interface{}{
-					"address": params.liveParams.sess.Address(),
-					"url":     params.liveParams.sess.Transcoder(),
-				},
+			pendingSwap = &pendingSwapEvent{
+				firstSwapReason:     err.Error(),
+				oldOrchestratorAddr: liveOrchestratorAddress(params.liveParams),
+				oldOrchestratorURL:  liveOrchestratorURL(params.liveParams),
+			}
+		}
+		if pendingSwap != nil {
+			errorMessage := "failed selecting replacement orchestrator"
+			if pendingSwap.lastSwapReason != "" {
+				errorMessage = fmt.Sprintf(
+					"%s (first_swap_reason=%s; last_attempt_reason=%s)",
+					errorMessage,
+					pendingSwap.firstSwapReason,
+					pendingSwap.lastSwapReason,
+				)
+			} else if pendingSwap.firstSwapReason != "" {
+				errorMessage = fmt.Sprintf("%s (first_swap_reason=%s)", errorMessage, pendingSwap.firstSwapReason)
+			}
+			emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+				Type:                   monitor.AIStreamEventTypeSwapFailed,
+				ErrorType:              monitor.AIStreamErrorTypeOrchestratorSwapFailed,
+				Message:                errorMessage,
+				OldOrchestratorAddress: pendingSwap.oldOrchestratorAddr,
+				OldOrchestratorURL:     pendingSwap.oldOrchestratorURL,
+				SwapReason:             pendingSwap.firstSwapReason,
+				Stage:                  "swap",
 			})
 		}
 		if isFirst {
@@ -1045,13 +1077,28 @@ func (ls *LivepeerServer) CreateWhip(server *media.WHIPServer) http.Handler {
 				}
 			}
 
-			sendErrorEvent := LiveErrorEventSender(ctx, streamID, map[string]string{
-				"type":        "error",
-				"request_id":  requestID,
-				"stream_id":   streamID,
-				"pipeline_id": pipelineID,
-				"pipeline":    pipeline,
-			})
+			if outputURL != "" {
+				rtmpOutputs = append(rtmpOutputs, outputURL)
+			}
+			if mediamtxOutputURL != "" {
+				rtmpOutputs = append(rtmpOutputs, mediamtxOutputURL, mediaMTXOutputAlias)
+			}
+			clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs)
+
+			liveParams := &liveRequestParams{
+				segmentReader:          ssr,
+				rtmpOutputs:            rtmpOutputs,
+				localRTMPPrefix:        internalOutputHost,
+				stream:                 streamName,
+				paymentProcessInterval: ls.livePaymentInterval,
+				outSegmentTimeout:      ls.outSegmentTimeout,
+				requestID:              requestID,
+				streamID:               streamID,
+				pipelineID:             pipelineID,
+				pipeline:               pipeline,
+				orchestrator:           orchestrator,
+			}
+			sendErrorEvent := LiveErrorEventSender(ctx, liveParams)
 			kickInput := func(err error) {
 				if err == nil {
 					return
@@ -1060,6 +1107,8 @@ func (ls *LivepeerServer) CreateWhip(server *media.WHIPServer) http.Handler {
 				sendErrorEvent(err)
 				whipConn.Close()
 			}
+			liveParams.sendErrorEvent = sendErrorEvent
+			liveParams.kickInput = kickInput
 
 			clog.Info(ctx, "Received live video AI request", "pipelineParams", pipelineParams)
 
@@ -1067,16 +1116,12 @@ func (ls *LivepeerServer) CreateWhip(server *media.WHIPServer) http.Handler {
 			GatewayStatus.Clear(streamID)
 			GatewayStatus.StoreKey(streamID, "whep_url", whepURL)
 
-			monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-				"type":        "gateway_receive_stream_request",
-				"timestamp":   streamRequestTime,
-				"stream_id":   streamID,
-				"pipeline_id": pipelineID,
-				"request_id":  requestID,
-				"orchestrator_info": map[string]interface{}{
-					"address": "",
-					"url":     "",
-				},
+			monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+				Type:       monitor.StreamTraceGatewayReceiveStreamRequest,
+				Timestamp:  streamRequestTime,
+				StreamID:   streamID,
+				PipelineID: pipelineID,
+				RequestID:  requestID,
 			})
 
 			clog.V(common.VERBOSE).Infof(ctx, "AI Live video attempt")
@@ -1094,47 +1139,19 @@ func (ls *LivepeerServer) CreateWhip(server *media.WHIPServer) http.Handler {
 					err = errors.New("whip disconnected")
 				}
 				sendErrorEvent(err)
-				monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-					"type":        "gateway_ingest_stream_closed",
-					"timestamp":   time.Now().UnixMilli(),
-					"stream_id":   streamID,
-					"pipeline_id": pipelineID,
-					"request_id":  requestID,
-					"orchestrator_info": map[string]interface{}{
-						"address": "",
-						"url":     "",
-					},
+				monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+					Type:       monitor.StreamTraceGatewayIngestStreamClosed,
+					StreamID:   streamID,
+					PipelineID: pipelineID,
+					RequestID:  requestID,
 				})
 			}()
-
-			if outputURL != "" {
-				rtmpOutputs = append(rtmpOutputs, outputURL)
-			}
-			if mediamtxOutputURL != "" {
-				rtmpOutputs = append(rtmpOutputs, mediamtxOutputURL, mediaMTXOutputAlias)
-			}
-			clog.Info(ctx, "RTMP outputs", "destinations", rtmpOutputs)
 
 			params := aiRequestParams{
 				node:        ls.LivepeerNode,
 				os:          drivers.NodeStorage.NewSession(requestID),
 				sessManager: ls.AISessionManager,
-
-				liveParams: &liveRequestParams{
-					segmentReader:          ssr,
-					rtmpOutputs:            rtmpOutputs,
-					localRTMPPrefix:        internalOutputHost,
-					stream:                 streamName,
-					paymentProcessInterval: ls.livePaymentInterval,
-					outSegmentTimeout:      ls.outSegmentTimeout,
-					requestID:              requestID,
-					streamID:               streamID,
-					pipelineID:             pipelineID,
-					pipeline:               pipeline,
-					kickInput:              kickInput,
-					sendErrorEvent:         sendErrorEvent,
-					orchestrator:           orchestrator,
-				},
+				liveParams:  liveParams,
 			}
 
 			registerControl(ctx, params)
@@ -1233,7 +1250,7 @@ func runStats(ctx context.Context, whipConn *media.WHIPConnection, streamID stri
 				"stats": stats,
 			})
 
-			monitor.SendQueueEventAsync("stream_ingest_metrics", map[string]interface{}{
+			monitor.EmitQueueEvent(monitor.KafkaTopicStreamIngestMets, map[string]interface{}{
 				"timestamp":   time.Now().UnixMilli(),
 				"stream_id":   streamID,
 				"pipeline_id": pipelineID,

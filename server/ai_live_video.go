@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -112,10 +111,17 @@ func startTricklePublish(ctx context.Context, url *url.URL, params aiRequestPara
 		}
 		thisSeq, atMax := slowOrchChecker.BeginSegment()
 		if atMax {
+			suspendErr := errors.New("orchestrator is slow")
 			clog.Infof(ctx, "Orchestrator is slow - terminating")
+			emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+				Type:      monitor.AIStreamEventTypeSuspend,
+				ErrorType: monitor.AIStreamErrorTypeSlowOrchestrator,
+				Message:   suspendErr.Error(),
+				Stage:     "publish",
+			})
 			suspendOrchestrator(ctx, params)
 			cancel()
-			stopProcessing(ctx, params, errors.New("orchestrator is slow"))
+			stopProcessing(ctx, params, suspendErr)
 			return
 		}
 		go func(seq int) {
@@ -157,15 +163,14 @@ func startTricklePublish(ctx context.Context, url *url.URL, params aiRequestPara
 					// no error, all done, let's leave
 					if monitor.Enabled && firstSegment {
 						firstSegment = false
-						monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-							"type":        "gateway_send_first_ingest_segment",
-							"timestamp":   time.Now().UnixMilli(),
-							"stream_id":   params.liveParams.streamID,
-							"pipeline_id": params.liveParams.pipelineID,
-							"request_id":  params.liveParams.requestID,
-							"orchestrator_info": map[string]interface{}{
-								"address": sess.Address(),
-								"url":     sess.Transcoder(),
+						monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+							Type:       monitor.StreamTraceGatewaySendFirstIngestSegment,
+							StreamID:   params.liveParams.streamID,
+							PipelineID: params.liveParams.pipelineID,
+							RequestID:  params.liveParams.requestID,
+							OrchestratorInfo: monitor.OrchestratorInfo{
+								Address: sess.Address(),
+								URL:     sess.Transcoder(),
 							},
 						})
 					}
@@ -327,8 +332,15 @@ func startTrickleSubscribe(ctx context.Context, url *url.URL, params aiRequestPa
 				maxSegmentDelay := params.liveParams.outSegmentTimeout / 2
 				if segmentAge < maxSegmentDelay && params.inputStreamExists() {
 					// we have some recent input but no output from orch, so kick
+					suspendErr := fmt.Errorf("trickle subscribe error, swapping: %w", err)
+					emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeSuspend,
+						ErrorType: monitor.AIStreamErrorTypeSubscribeError,
+						Message:   suspendErr.Error(),
+						Stage:     "subscribe",
+					})
 					suspendOrchestrator(ctx, params)
-					stopProcessing(ctx, params, fmt.Errorf("trickle subscribe error, swapping: %w", err))
+					stopProcessing(ctx, params, suspendErr)
 					return
 				}
 				clog.InfofErr(ctx, "trickle subscribe error copying segment seq=%d", seq, err)
@@ -341,15 +353,14 @@ func startTrickleSubscribe(ctx context.Context, url *url.URL, params aiRequestPa
 				delayMs := time.Since(params.liveParams.startTime).Milliseconds()
 				if monitor.Enabled {
 					monitor.AIFirstSegmentDelay(delayMs, params.liveParams.sess.OrchestratorInfo)
-					monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-						"type":        "gateway_receive_first_processed_segment",
-						"timestamp":   time.Now().UnixMilli(),
-						"stream_id":   params.liveParams.streamID,
-						"pipeline_id": params.liveParams.pipelineID,
-						"request_id":  params.liveParams.requestID,
-						"orchestrator_info": map[string]interface{}{
-							"address": params.liveParams.sess.Address(),
-							"url":     params.liveParams.sess.Transcoder(),
+					monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+						Type:       monitor.StreamTraceGatewayRecvFirstProcSegment,
+						StreamID:   params.liveParams.streamID,
+						PipelineID: params.liveParams.pipelineID,
+						RequestID:  params.liveParams.requestID,
+						OrchestratorInfo: monitor.OrchestratorInfo{
+							Address: params.liveParams.sess.Address(),
+							URL:     params.liveParams.sess.Transcoder(),
 						},
 					})
 				}
@@ -359,15 +370,14 @@ func startTrickleSubscribe(ctx context.Context, url *url.URL, params aiRequestPa
 			if segmentsReceived == 3 && monitor.Enabled {
 				// We assume that after receiving 3 segments, the runner started successfully
 				// and we should be able to start the playback
-				monitor.SendQueueEventAsync("stream_trace", map[string]interface{}{
-					"type":        "gateway_receive_few_processed_segments",
-					"timestamp":   time.Now().UnixMilli(),
-					"stream_id":   params.liveParams.streamID,
-					"pipeline_id": params.liveParams.pipelineID,
-					"request_id":  params.liveParams.requestID,
-					"orchestrator_info": map[string]interface{}{
-						"address": sess.Address(),
-						"url":     sess.Transcoder(),
+				monitor.EmitStreamTraceEvent(monitor.StreamTraceEvent{
+					Type:       monitor.StreamTraceGatewayRecvFewProcSegments,
+					StreamID:   params.liveParams.streamID,
+					PipelineID: params.liveParams.pipelineID,
+					RequestID:  params.liveParams.requestID,
+					OrchestratorInfo: monitor.OrchestratorInfo{
+						Address: sess.Address(),
+						URL:     sess.Transcoder(),
 					},
 				})
 
@@ -391,8 +401,15 @@ func startTrickleSubscribe(ctx context.Context, url *url.URL, params aiRequestPa
 				hasRecentInput := lastInputSegmentAge < segmentTimeout/2
 				if hasRecentInput && params.inputStreamExists() {
 					// abandon the orchestrator
+					timeoutErr := fmt.Errorf("timeout waiting for segments")
+					emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeError,
+						ErrorType: monitor.AIStreamErrorTypeNetworkTimeout,
+						Message:   timeoutErr.Error(),
+						Stage:     "subscribe",
+					})
 					suspendOrchestrator(ctx, params)
-					stopProcessing(ctx, params, fmt.Errorf("timeout waiting for segments"))
+					stopProcessing(ctx, params, timeoutErr)
 					segmentTicker.Stop()
 					return
 				}
@@ -616,7 +633,7 @@ func startControlPublish(ctx context.Context, control *url.URL, params aiRequest
 
 	reportUpdate := func(data []byte) {
 		// send the param update to kafka
-		monitor.SendQueueEventAsync("ai_stream_events", map[string]interface{}{
+		monitor.EmitQueueEvent(monitor.KafkaTopicAIStreamEvents, map[string]interface{}{
 			"type":        "params_update",
 			"stream_id":   params.liveParams.streamID,
 			"request_id":  params.liveParams.requestID,
@@ -785,7 +802,7 @@ func startEventsSubscribe(ctx context.Context, url *url.URL, params aiRequestPar
 					clog.Infof(ctx, "Failed to parse JSON as direct event: %s", err)
 					continue
 				}
-				queueEventType = "ai_stream_events"
+				queueEventType = string(monitor.KafkaTopicAIStreamEvents)
 			}
 
 			event["stream_id"] = streamId
@@ -809,6 +826,23 @@ func startEventsSubscribe(ctx context.Context, url *url.URL, params aiRequestPar
 			if !ok {
 				eventType = "unknown"
 				clog.Warningf(ctx, "Received event without a type stream=%s event=%+v", stream, event)
+			}
+			if eventType == "error" {
+				errorMessage := monitor.FirstNonEmpty(
+					monitor.MapStringValue(event, "message"),
+					"orchestrator inference failure",
+				)
+				emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+					Type:                monitor.AIStreamEventTypeError,
+					ErrorType:           monitor.AIStreamErrorTypeOrchestratorInferenceFailure,
+					Message:             errorMessage,
+					OrchestratorAddress: monitor.FirstNonEmpty(monitor.MapStringValue(event, "orchestrator_address"), liveOrchestratorAddress(params.liveParams)),
+					OrchestratorURL:     monitor.FirstNonEmpty(monitor.MapStringValue(event, "orchestrator_url"), liveOrchestratorURL(params.liveParams)),
+					GPUID:               monitor.MapStringValue(event, "gpu_id"),
+					ModelID:             monitor.FirstNonEmpty(monitor.MapStringValue(event, "model_id"), params.liveParams.pipeline),
+					Stage:               "events_subscribe",
+				})
+				continue
 			}
 
 			if eventType == "status" {
@@ -837,7 +871,7 @@ func startEventsSubscribe(ctx context.Context, url *url.URL, params aiRequestPar
 				StreamStatusStore.Store(streamId, event)
 			}
 
-			monitor.SendQueueEventAsync(queueEventType, event)
+			monitor.EmitQueueEvent(monitor.KafkaTopic(queueEventType), event)
 		}
 	}()
 
@@ -851,7 +885,14 @@ func startEventsSubscribe(ctx context.Context, url *url.URL, params aiRequestPar
 				eventTime := lastEvent
 				lastEventMu.Unlock()
 				if time.Now().Sub(eventTime) > maxEventGap {
-					stopProcessing(ctx, params, fmt.Errorf("timeout waiting for events"))
+					timeoutErr := fmt.Errorf("timeout waiting for events")
+					emitLiveIssueEvent(ctx, params.liveParams, monitor.AIStreamIssueEvent{
+						Type:      monitor.AIStreamEventTypeError,
+						ErrorType: monitor.AIStreamErrorTypeNetworkTimeout,
+						Message:   timeoutErr.Error(),
+						Stage:     "events_subscribe",
+					})
+					stopProcessing(ctx, params, timeoutErr)
 					eventTicker.Stop()
 					return
 				}
@@ -938,18 +979,73 @@ func (s *SlowOrchChecker) GetCount() int {
 	return s.segmentCount
 }
 
-func LiveErrorEventSender(ctx context.Context, streamID string, event map[string]string) func(err error) {
+func LiveErrorEventSender(ctx context.Context, params *liveRequestParams) func(err error) {
 	return func(err error) {
-		GatewayStatus.StoreIfNotExists(streamID, "error", map[string]interface{}{
-			"error_message": err.Error(),
-			"error_time":    time.Now().UnixMilli(),
+		if err == nil || params == nil {
+			return
+		}
+		GatewayStatus.StoreIfNotExists(params.streamID, "error", map[string]interface{}{
+			"message":    err.Error(),
+			"error_time": time.Now().UnixMilli(),
 		})
-
-		ev := maps.Clone(event)
-		ev["capability"] = clog.GetVal(ctx, "capability")
-		ev["message"] = err.Error()
-		monitor.SendQueueEventAsync("ai_stream_events", ev)
+		emitLiveIssueEvent(ctx, params, monitor.AIStreamIssueEvent{
+			Type:      monitor.AIStreamEventTypeError,
+			ErrorType: monitor.AIStreamErrorTypeGatewayError,
+			Message:   err.Error(),
+			Stage:     "gateway",
+		})
 	}
+}
+
+func emitLiveIssueEvent(ctx context.Context, params *liveRequestParams, ev monitor.AIStreamIssueEvent) {
+	if params == nil {
+		return
+	}
+	if ev.StreamID == "" {
+		ev.StreamID = params.streamID
+	}
+	if ev.Pipeline == "" {
+		ev.Pipeline = params.pipeline
+	}
+	if ev.PipelineID == "" {
+		ev.PipelineID = params.pipelineID
+	}
+	if ev.RequestID == "" {
+		ev.RequestID = params.requestID
+	}
+	if ev.ModelID == "" {
+		ev.ModelID = params.pipeline
+	}
+	if ev.OrchestratorAddress == "" {
+		ev.OrchestratorAddress = liveOrchestratorAddress(params)
+	}
+	if ev.OrchestratorURL == "" {
+		ev.OrchestratorURL = liveOrchestratorURL(params)
+	}
+	if ev.OrchestratorInfo == nil && ev.OrchestratorAddress != "" {
+		ev.OrchestratorInfo = map[string]interface{}{
+			"address": ev.OrchestratorAddress,
+			"url":     ev.OrchestratorURL,
+		}
+	}
+	if ev.Capability == nil {
+		ev.Capability = clog.GetVal(ctx, "capability")
+	}
+	monitor.EmitAIStreamIssueEvent(ev)
+}
+
+func liveOrchestratorAddress(params *liveRequestParams) string {
+	if params == nil || params.sess == nil {
+		return ""
+	}
+	return params.sess.Address()
+}
+
+func liveOrchestratorURL(params *liveRequestParams) string {
+	if params == nil || params.sess == nil {
+		return ""
+	}
+	return params.sess.Transcoder()
 }
 
 func logToDisk(ctx context.Context, r media.CloneableReader, workdir string, requestID, manifestID string, seq int) {

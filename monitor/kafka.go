@@ -20,6 +20,18 @@ const (
 	KafkaChannelSize    = 100
 )
 
+type KafkaTopic string
+
+const (
+	KafkaTopicAIStreamEvents   KafkaTopic = "ai_stream_events"
+	KafkaTopicAIStreamStatus   KafkaTopic = "ai_stream_status"
+	KafkaTopicStreamTrace      KafkaTopic = "stream_trace"
+	KafkaTopicStreamIngestMets KafkaTopic = "stream_ingest_metrics"
+	KafkaTopicNetworkCaps      KafkaTopic = "network_capabilities"
+	KafkaTopicDiscoveryResults KafkaTopic = "discovery_results"
+	KafkaTopicCreateNewPayment KafkaTopic = "create_new_payment"
+)
+
 type KafkaProducer struct {
 	writer         *kafka.Writer
 	topic          string
@@ -54,6 +66,7 @@ type PipelineStatus struct {
 
 var kafkaProducer *KafkaProducer
 
+// InitKafkaProducer initializes the global async Kafka producer used for queue events.
 func InitKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress string) error {
 	producer, err := newKafkaProducer(bootstrapServers, user, password, topic, gatewayAddress)
 	if err != nil {
@@ -149,7 +162,10 @@ func (p *KafkaProducer) sendBatch(eventsBatch []kafka.Message) {
 	}
 }
 
-func SendQueueEventAsync(eventType string, data interface{}) {
+// EmitQueueEvent enqueues an event for asynchronous Kafka delivery.
+// Prefer typed wrappers (for example EmitStreamTraceEvent and other schema-specific emitters)
+// at call sites to avoid hardcoded topic strings and ad-hoc payloads.
+func EmitQueueEvent(topic KafkaTopic, data any) {
 	if kafkaProducer == nil {
 		return
 	}
@@ -160,7 +176,7 @@ func SendQueueEventAsync(eventType string, data interface{}) {
 	event := GatewayEvent{
 		ID:        stringPtr(randomID),
 		Gateway:   stringPtr(kafkaProducer.gatewayAddress),
-		Type:      &eventType,
+		Type:      stringPtr(string(topic)),
 		Timestamp: stringPtr(fmt.Sprint(timestampMs)),
 		Data:      data,
 	}
@@ -168,7 +184,7 @@ func SendQueueEventAsync(eventType string, data interface{}) {
 	select {
 	case kafkaProducer.events <- event:
 	default:
-		glog.Warningf("kafka producer event queue is full, dropping event %q", eventType)
+		glog.Warningf("kafka producer event queue is full, dropping event %q", string(topic))
 	}
 }
 
