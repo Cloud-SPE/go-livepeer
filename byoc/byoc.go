@@ -178,6 +178,9 @@ func (bsg *BYOCGatewayServer) registerRoutes() {
 
 	//TODO: add WHEP support
 
+	// Worker options aggregation
+	bsg.httpMux.Handle("GET /process/options", bsg.GetWorkerOptions())
+
 	// Job submission routes for batch processing
 	bsg.httpMux.Handle("/process/request/", bsg.SubmitJob())
 }
@@ -198,17 +201,23 @@ type BYOCOrchestratorServer struct {
 
 	httpMux *http.ServeMux
 
-	sharedBalMtx *sync.Mutex
+	sharedBalMtx      *sync.Mutex
+	optionsPollMu     *sync.Mutex
+	optionsPollCancel map[string]context.CancelFunc
+	optionsHTTPClient *http.Client
 }
 
 func NewBYOCOrchestratorServer(node *core.LivepeerNode, orch Orchestrator, trickleSrv *trickle.Server, trickleBasePath string, mux *http.ServeMux) *BYOCOrchestratorServer {
 	bso := &BYOCOrchestratorServer{
-		node:            node,
-		orch:            orch,
-		trickleSrv:      trickleSrv,
-		trickleBasePath: trickleBasePath,
-		httpMux:         mux,
-		sharedBalMtx:    &sync.Mutex{},
+		node:              node,
+		orch:              orch,
+		trickleSrv:        trickleSrv,
+		trickleBasePath:   trickleBasePath,
+		httpMux:           mux,
+		sharedBalMtx:      &sync.Mutex{},
+		optionsPollMu:     &sync.Mutex{},
+		optionsPollCancel: make(map[string]context.CancelFunc),
+		optionsHTTPClient: &http.Client{},
 	}
 
 	bso.registerRoutes()
@@ -226,6 +235,7 @@ func (bso *BYOCOrchestratorServer) registerRoutes() {
 	// Job submission routes for batch processing
 	bso.httpMux.Handle("/process/request/", bso.ProcessJob())
 	bso.httpMux.Handle("/process/token", bso.GetJobToken())
+	bso.httpMux.Handle("GET /process/options", bso.GetWorkerOptions())
 	bso.httpMux.Handle("/capability/register", bso.RegisterCapability())
 	bso.httpMux.Handle("/capability/unregister", bso.UnregisterCapability())
 	// Stream routes

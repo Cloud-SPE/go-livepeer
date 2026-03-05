@@ -15,15 +15,19 @@ import (
 )
 
 type ExternalCapability struct {
-	Name          string `json:"name"`
-	Description   string `json:"description"`
-	Url           string `json:"url"`
-	Capacity      int    `json:"capacity"`
-	PricePerUnit  int64  `json:"price_per_unit"`
-	PriceScaling  int64  `json:"price_scaling"`
-	PriceCurrency string `json:"currency"`
+	Name                       string                 `json:"name"`
+	Description                string                 `json:"description"`
+	Url                        string                 `json:"url"`
+	OptionsEndpoint            string                 `json:"options_endpoint,omitempty"`
+	OptionsPollIntervalSeconds int                    `json:"options_poll_interval_seconds,omitempty"`
+	Capacity                   int                    `json:"capacity"`
+	PricePerUnit               int64                  `json:"price_per_unit"`
+	PriceScaling               int64                  `json:"price_scaling"`
+	PriceCurrency              string                 `json:"currency"`
+	WorkerOptions              []map[string]interface{} `json:"worker_options,omitempty"`
 
-	price *AutoConvertedPrice
+	price              *AutoConvertedPrice
+	optionsLastUpdated time.Time
 
 	Mu   sync.RWMutex
 	Load int
@@ -103,13 +107,13 @@ func (sd *StreamInfo) cleanup() {
 
 type ExternalCapabilities struct {
 	capm         sync.Mutex
-	Capabilities map[string]*ExternalCapability
+	Capabilities map[string]map[string]*ExternalCapability // outer key = capability name, inner key = runner URL
 	Streams      map[string]*StreamInfo
 }
 
 func NewExternalCapabilities() *ExternalCapabilities {
 	return &ExternalCapabilities{
-		Capabilities: make(map[string]*ExternalCapability),
+		Capabilities: make(map[string]map[string]*ExternalCapability),
 		Streams:      make(map[string]*StreamInfo)}
 }
 
@@ -195,11 +199,142 @@ func (extCaps *ExternalCapabilities) RemoveCapability(extCap string) {
 	delete(extCaps.Capabilities, extCap)
 }
 
+// RemoveCapabilityRunner removes a single runner URL from a capability. If it is
+// the last runner for that capability, the capability entry is also removed.
+func (extCaps *ExternalCapabilities) RemoveCapabilityRunner(name, url string) {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return
+	}
+	delete(runners, url)
+	if len(runners) == 0 {
+		delete(extCaps.Capabilities, name)
+	}
+}
+
+// GetCapability returns any one runner for the given capability name.
+func (extCaps *ExternalCapabilities) GetCapability(extCap string) (*ExternalCapability, bool) {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[extCap]
+	if !ok {
+		return nil, false
+	}
+	for _, cap := range runners {
+		return cap, true
+	}
+	return nil, false
+}
+
+// GetCapabilityRunner returns the specific runner entry for a capability name + URL pair.
+func (extCaps *ExternalCapabilities) GetCapabilityRunner(name, url string) (*ExternalCapability, bool) {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return nil, false
+	}
+	cap, ok := runners[url]
+	return cap, ok
+}
+
+// SelectRunner returns the runner with the most available capacity for the given
+// capability name that also satisfies the options filter. If filter is empty all
+// runners are considered. Returns nil if no matching runner is found.
+func (extCaps *ExternalCapabilities) SelectRunner(name string, filter map[string]string) *ExternalCapability {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return nil
+	}
+	var best *ExternalCapability
+	var bestAvail int
+	for _, cap := range runners {
+		if !AnyOptionsMatch(filter, cap.GetWorkerOptionsCopy()) {
+			continue
+		}
+		avail := cap.Capacity - cap.Load
+		if avail > bestAvail {
+			bestAvail = avail
+			best = cap
+		}
+	}
+	return best
+}
+
+// SelectAndReserveRunner atomically selects the runner with the most available
+// capacity that satisfies the options filter, then increments its Load.
+// If filter is empty all runners are considered.
+// Returns an error if no matching runner with available capacity is found.
+func (extCaps *ExternalCapabilities) SelectAndReserveRunner(name string, filter map[string]string) (*ExternalCapability, error) {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return nil, fmt.Errorf("no runners registered for capability %v", name)
+	}
+	var best *ExternalCapability
+	var bestAvail int
+	for _, cap := range runners {
+		if !AnyOptionsMatch(filter, cap.GetWorkerOptionsCopy()) {
+			continue
+		}
+		avail := cap.Capacity - cap.Load
+		if avail > bestAvail {
+			bestAvail = avail
+			best = cap
+		}
+	}
+	if best == nil || bestAvail <= 0 {
+		return nil, fmt.Errorf("no available capacity for capability %v", name)
+	}
+	best.Mu.Lock()
+	best.Load++
+	best.Mu.Unlock()
+	return best, nil
+}
+
+// GetCapabilityWorkerOptions returns the aggregated WorkerOptions from all runners
+// registered for the given capability name.
+func (extCaps *ExternalCapabilities) GetCapabilityWorkerOptions(extCap string) []map[string]interface{} {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+
+	runners, ok := extCaps.Capabilities[extCap]
+	if !ok {
+		return nil
+	}
+	var result []map[string]interface{}
+	for _, cap := range runners {
+		result = append(result, cap.GetWorkerOptionsCopy()...)
+	}
+	return result
+}
+
+// GetAllWorkerOptions returns the cached WorkerOptions from every registered runner
+// across all capabilities, flattened into a single slice.
+func (extCaps *ExternalCapabilities) GetAllWorkerOptions() []map[string]interface{} {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+
+	var result []map[string]interface{}
+	for _, runners := range extCaps.Capabilities {
+		for _, cap := range runners {
+			result = append(result, cap.GetWorkerOptionsCopy()...)
+		}
+	}
+	return result
+}
+
 func (extCaps *ExternalCapabilities) RegisterCapability(extCapability string) (*ExternalCapability, error) {
 	extCaps.capm.Lock()
 	defer extCaps.capm.Unlock()
 	if extCaps.Capabilities == nil {
-		extCaps.Capabilities = make(map[string]*ExternalCapability)
+		extCaps.Capabilities = make(map[string]map[string]*ExternalCapability)
 	}
 	var extCap ExternalCapability
 	err := json.Unmarshal([]byte(extCapability), &extCap)
@@ -218,13 +353,11 @@ func (extCaps *ExternalCapabilities) RegisterCapability(extCapability string) (*
 	if err != nil {
 		panic(fmt.Errorf("error converting price: %v", err))
 	}
-	if cap, ok := extCaps.Capabilities[extCap.Name]; ok {
-		cap.Url = extCap.Url
-		cap.Capacity = extCap.Capacity
-		cap.price = extCap.price
-	}
 
-	extCaps.Capabilities[extCap.Name] = &extCap
+	if extCaps.Capabilities[extCap.Name] == nil {
+		extCaps.Capabilities[extCap.Name] = make(map[string]*ExternalCapability)
+	}
+	extCaps.Capabilities[extCap.Name][extCap.Url] = &extCap
 
 	return &extCap, err
 }
@@ -233,4 +366,57 @@ func (extCap *ExternalCapability) GetPrice() *big.Rat {
 	extCap.Mu.RLock()
 	defer extCap.Mu.RUnlock()
 	return extCap.price.Value()
+}
+
+func (extCap *ExternalCapability) SetWorkerOptions(options []map[string]interface{}) {
+	extCap.Mu.Lock()
+	defer extCap.Mu.Unlock()
+	extCap.WorkerOptions = copyWorkerOptionsList(options)
+	extCap.optionsLastUpdated = time.Now()
+}
+
+func (extCap *ExternalCapability) GetWorkerOptionsCopy() []map[string]interface{} {
+	extCap.Mu.RLock()
+	defer extCap.Mu.RUnlock()
+	return copyWorkerOptionsList(extCap.WorkerOptions)
+}
+
+func (extCap *ExternalCapability) GetOptionsPollConfig() (string, time.Duration) {
+	extCap.Mu.RLock()
+	defer extCap.Mu.RUnlock()
+
+	interval := 30 * time.Second
+	if extCap.OptionsPollIntervalSeconds > 0 {
+		interval = time.Duration(extCap.OptionsPollIntervalSeconds) * time.Second
+	}
+
+	return extCap.OptionsEndpoint, interval
+}
+
+func copyWorkerOptionsList(in []map[string]interface{}) []map[string]interface{} {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]map[string]interface{}, len(in))
+	for i, m := range in {
+		mc := make(map[string]interface{}, len(m))
+		for k, v := range m {
+			mc[k] = v
+		}
+		out[i] = mc
+	}
+	return out
+}
+
+func copyWorkerOptions(in map[string]interface{}) map[string]interface{} {
+	if len(in) == 0 {
+		return nil
+	}
+
+	out := make(map[string]interface{}, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+
+	return out
 }

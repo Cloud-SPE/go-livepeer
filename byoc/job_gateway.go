@@ -419,17 +419,31 @@ func getJobOrchestrators(ctx context.Context, node *core.LivepeerNode, capabilit
 		select {
 		case token := <-tokenCh:
 			if token.AvailableCapacity > 0 {
-				jobTokens = append(jobTokens, token)
+				if matched := core.FindMatchingOption(params.OptionsFilter, token.WorkerOptions); matched != nil || len(params.OptionsFilter) == 0 {
+					filterJSON, _ := json.Marshal(params.OptionsFilter)
+					matchedJSON, _ := json.Marshal(matched)
+					allOptsJSON, _ := json.Marshal(token.WorkerOptions)
+					clog.V(common.VERBOSE).Infof(ctx, "job selection orch=%v accepted filter=%v matched_option=%v all_options=%v", token.ServiceAddr, string(filterJSON), string(matchedJSON), string(allOptsJSON))
+					jobTokens = append(jobTokens, token)
+				} else {
+					filterJSON, _ := json.Marshal(params.OptionsFilter)
+					optsJSON, _ := json.Marshal(token.WorkerOptions)
+					clog.V(common.VERBOSE).Infof(ctx, "job selection orch=%v rejected filter=%v worker_options=%v", token.ServiceAddr, string(filterJSON), string(optsJSON))
+				}
+			} else {
+				clog.V(common.VERBOSE).Infof(ctx, "job selection orch=%v skipped no_capacity", token.ServiceAddr)
 			}
 			nbResp++
 		case <-errCh:
 			nbResp++
 		case <-tokensCtx.Done():
 			//searchTimeout reached, return tokens received
+			clog.V(common.VERBOSE).Infof(ctx, "job selection timeout reached selected=%v", len(jobTokens))
 			return jobTokens, nil
 		}
 	}
 
+	clog.V(common.VERBOSE).Infof(ctx, "job selection selected=%v from=%v orchs", len(jobTokens), nbResp)
 	// received enough tokens or all responses arrived
 	return jobTokens, nil
 }
@@ -514,4 +528,82 @@ func getToken(ctx context.Context, respTimeout time.Duration, orchUrl, capabilit
 		return nil, err
 	}
 	return nil, fmt.Errorf("failed to get token from Orchestrator after %d attempts", attempt)
+}
+
+// GetWorkerOptions fans out GET /process/options to every Orchestrator in the
+// pool, merges the results, and returns the deduplicated union as a JSON array.
+// This is the endpoint called by the gateway-proxy's /v1/models handler.
+func (bsg *BYOCGatewayServer) GetWorkerOptions() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		orchs := bsg.node.OrchestratorPool.GetInfos()
+
+		type orchResult struct {
+			options []map[string]interface{}
+		}
+		resultCh := make(chan orchResult, len(orchs))
+
+		reqCtx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+
+		ctx := r.Context()
+		for _, orch := range orchs {
+			go func(orchURL string) {
+				req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, orchURL+"/process/options", nil)
+				if err != nil {
+					clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions orch=%v failed to create request err=%v", orchURL, err)
+					resultCh <- orchResult{}
+					return
+				}
+				resp, err := httpClient.Do(req)
+				if err != nil {
+					clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions orch=%v request failed err=%v", orchURL, err)
+					resultCh <- orchResult{}
+					return
+				}
+				defer resp.Body.Close()
+
+				if resp.StatusCode != http.StatusOK {
+					clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions orch=%v non-200 status=%v", orchURL, resp.StatusCode)
+					resultCh <- orchResult{}
+					return
+				}
+
+				var opts []map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&opts); err != nil {
+					clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions orch=%v failed to decode response err=%v", orchURL, err)
+					resultCh <- orchResult{}
+					return
+				}
+				optsJSON, _ := json.Marshal(opts)
+				clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions orch=%v received options=%v", orchURL, string(optsJSON))
+				resultCh <- orchResult{options: opts}
+			}(orch.URL.String())
+		}
+
+		// Collect results; deduplicate by stable JSON fingerprint.
+		// encoding/json marshals map keys in sorted order, so this is deterministic.
+		seen := make(map[string]struct{})
+		all := make([]map[string]interface{}, 0)
+		for range orchs {
+			res := <-resultCh
+			for _, opt := range res.options {
+				key, _ := json.Marshal(opt)
+				if _, dup := seen[string(key)]; !dup {
+					seen[string(key)] = struct{}{}
+					all = append(all, opt)
+				} else {
+					clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions skipping duplicate key=%v", string(key))
+				}
+			}
+		}
+		clog.V(common.VERBOSE).Infof(ctx, "GetWorkerOptions total_unique=%v", len(all))
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(all)
+	})
 }
