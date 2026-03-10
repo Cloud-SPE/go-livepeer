@@ -1,0 +1,59 @@
+services:
+  remote-transcoder-nvidia:
+    image: ${RT_NVIDIA_IMAGE:-remote-transcoder-worker-nvidia:latest}
+    restart: unless-stopped
+    command:
+      - "-logtostderr=true"
+      - "-v=6"
+    environment:
+      # ── Required ──────────────────────────────────────────────────────────────────
+      ORCH_ADDR: ${ORCH_ADDR}         # Orchestrator address in host:port form (e.g. orch.example.com:8935)
+      ORCH_SECRET: ${ORCH_SECRET}     # Shared secret for authenticating with the orchestrator
+
+      # ── Capacity & backend ────────────────────────────────────────────────────────
+      TRANSCODER_CAPACITY: ${TRANSCODER_CAPACITY:-1}  # Concurrent transcode slots to register
+      TRANSCODER_BACKEND: nvidia
+      NVIDIA_DEVICES: ${NVIDIA_DEVICES:-all}          # Comma-separated GPU indices, or "all"
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_DEVICES:-all}  # Docker/NVIDIA runtime GPU visibility (mirrors NVIDIA_DEVICES)
+      NVIDIA_DRIVER_CAPABILITIES: ${NVIDIA_DRIVER_CAPABILITIES:-video,compute,utility}
+
+      # ── Paths ─────────────────────────────────────────────────────────────────────
+      WORK_DIR: ${WORK_DIR:-/tmp/livepeer-workdir}    # Staging directory for segment temp files
+      FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}             # Path to the ffmpeg binary
+      FFMPEG_LOGLEVEL: ${FFMPEG_LOGLEVEL:-error}      # ffmpeg log verbosity: quiet | error | warning | info | debug
+
+      # ── Quality tuning ────────────────────────────────────────────────────────────
+      # PRESET: p1 (fastest/lowest quality) … p7 (slowest/best). p5 is a good balance.
+      TRANSCODER_PRESET: ${TRANSCODER_PRESET:-p5}
+      # RC: Rate control mode. cbr | vbr | constqp
+      #     vbr allocates bits where scene complexity demands them, improving perceptual quality.
+      TRANSCODER_RC: ${TRANSCODER_RC:-vbr}
+      # CRF: VBR quality target passed as -cq (0=lossless, 51=worst quality).
+      #      Uncomment to cap minimum quality in vbr mode.
+      # TRANSCODER_CRF: ${TRANSCODER_CRF:-23}
+      # MAXRATE: Peak bitrate cap (e.g. 6000k). Prevents VBV over-spend on the first I-frame
+      #          of each segment, which causes visible bitrate pulsing at segment boundaries.
+      # TRANSCODER_MAXRATE: ${TRANSCODER_MAXRATE:-}
+      # BUFSIZE: VBV buffer size (e.g. 12000k). Recommended: 2× MAXRATE.
+      #          Larger bufsize allows more flexibility within the bitrate envelope.
+      # TRANSCODER_BUFSIZE: ${TRANSCODER_BUFSIZE:-}
+
+      # ── Advanced / optional ───────────────────────────────────────────────────────
+      # GOP: Keyframe interval override — frame count (e.g. "60") or duration (e.g. "2s").
+      #      Overrides the per-profile GOP. Leave unset to use profile-specified value.
+      # TRANSCODER_GOP: ${TRANSCODER_GOP:-}
+      # TUNE: Encoder tune flag. Valid only for libx264/libx265 software encode, not nvenc.
+      #       Options: film | animation | grain | stillimage | fastdecode | zerolatency
+      # TRANSCODER_TUNE: ${TRANSCODER_TUNE:-}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - livepeer_workdir:/tmp/livepeer-workdir
+
+volumes:
+  livepeer_workdir:

@@ -11,9 +11,9 @@ set -o nounset
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-currentTag="$(git describe --tags)"
+currentTag="$(git describe --tags 2>/dev/null || true)"
 currentVersion="$(cat "$DIR/VERSION")"
-currentSha="$(git describe --always --long --dirty --abbrev=8)"
+currentSha="$(git describe --always --long --dirty --abbrev=8 2>/dev/null || git rev-parse --short HEAD)"
 
 if [[ "$currentTag" == "v$currentVersion" ]]; then
   echo -en "$currentVersion"

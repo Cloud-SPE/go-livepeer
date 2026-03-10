@@ -1,0 +1,51 @@
+services:
+  remote-transcoder-qsv:
+    image: ${RT_QSV_IMAGE:-remote-transcoder-worker-qsv:latest}
+    restart: unless-stopped
+    command:
+      - "-logtostderr=true"
+      - "-v=6"
+    environment:
+      # ── Required ──────────────────────────────────────────────────────────────────
+      ORCH_ADDR: ${ORCH_ADDR}         # Orchestrator address in host:port form (e.g. orch.example.com:8935)
+      ORCH_SECRET: ${ORCH_SECRET}     # Shared secret for authenticating with the orchestrator
+
+      # ── Capacity & backend ────────────────────────────────────────────────────────
+      TRANSCODER_CAPACITY: ${TRANSCODER_CAPACITY:-1}           # Concurrent transcode slots to register
+      TRANSCODER_BACKEND: qsv
+      QSV_DEVICES: ${QSV_DEVICES:-/dev/dri/renderD128}         # DRI render node path (e.g. /dev/dri/renderD128)
+
+      # ── Paths ─────────────────────────────────────────────────────────────────────
+      WORK_DIR: ${WORK_DIR:-/tmp/livepeer-workdir}             # Staging directory for segment temp files
+      FFMPEG_PATH: ${FFMPEG_PATH:-ffmpeg}                      # Path to the ffmpeg binary
+      FFMPEG_LOGLEVEL: ${FFMPEG_LOGLEVEL:-error}               # ffmpeg log verbosity: quiet | error | warning | info | debug
+
+      # ── Quality tuning ────────────────────────────────────────────────────────────
+      # RC: Rate control mode. cbr | vbr | avbr | la | la_hrd | icq | la_icq | cqp
+      #     vbr allocates bits where scene complexity demands them.
+      #     la / la_icq use lookahead for better bit distribution (requires driver support).
+      TRANSCODER_RC: ${TRANSCODER_RC:-vbr}
+      # CRF: Perceptual quality target passed as -global_quality (0=lossless, 51=worst).
+      #      23 is a good starting point for 720p/1080p content.
+      TRANSCODER_CRF: ${TRANSCODER_CRF:-23}
+      # MAXRATE: Peak bitrate cap (e.g. 6000k). Prevents VBV over-spend on the first I-frame
+      #          of each segment, which causes visible bitrate pulsing at segment boundaries.
+      # TRANSCODER_MAXRATE: ${TRANSCODER_MAXRATE:-}
+      # BUFSIZE: VBV buffer size (e.g. 12000k). Recommended: 2× MAXRATE.
+      #          Larger bufsize allows more flexibility within the bitrate envelope.
+      # TRANSCODER_BUFSIZE: ${TRANSCODER_BUFSIZE:-}
+
+      # ── Advanced / optional ───────────────────────────────────────────────────────
+      # GOP: Keyframe interval override — frame count (e.g. "60") or duration (e.g. "2s").
+      #      Overrides the per-profile GOP. Leave unset to use profile-specified value.
+      # TRANSCODER_GOP: ${TRANSCODER_GOP:-}
+      # TUNE: Encoder tune flag. Valid only for libx264/libx265 software encode, not h264_qsv.
+      #       Options: film | animation | grain | stillimage | fastdecode | zerolatency
+      # TRANSCODER_TUNE: ${TRANSCODER_TUNE:-}
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - livepeer_workdir:/tmp/livepeer-workdir
+
+volumes:
+  livepeer_workdir:

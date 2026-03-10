@@ -119,11 +119,34 @@ livepeer_bench:
 livepeer_router:
 	GO111MODULE=on CGO_ENABLED=1 CC="$(cc)" CGO_CFLAGS="$(cgo_cflags)" CGO_LDFLAGS="$(cgo_ldflags) ${CGO_LDFLAGS}" go build -o $(GO_BUILD_DIR) -ldflags="$(ldflags)" cmd/livepeer_router/*.go
 
+remote_transcoder_worker:
+	@mkdir -p bin
+	GO111MODULE=on CGO_ENABLED=1 CC="$(cc)" CGO_CFLAGS="$(cgo_cflags)" CGO_LDFLAGS="$(cgo_ldflags)" go build -o bin/remote-transcoder-worker -ldflags="$(ldflags)" ./cmd/remote_transcoder_worker
+
 docker:
 	docker buildx build --build-arg='BUILD_TAGS=mainnet,experimental' -f docker/Dockerfile .
 
 docker_mtx:
 	docker buildx build -f docker/Dockerfile.mediamtx docker/
+
+DOCKER_TAG ?= latest
+FFMPEG_VERSION ?= 7.1.1
+CUDA_VERSION ?= 12.4.1
+NV_CODEC_HEADERS_VERSION ?= 12.2.72.0
+
+docker_remote_transcoder_nvidia:
+	docker build -t remote-transcoder-worker-nvidia:$(DOCKER_TAG) -f docker/Dockerfile.remote-transcoder-nvidia \
+		--build-arg FFMPEG_VERSION=$(FFMPEG_VERSION) \
+		--build-arg CUDA_VERSION=$(CUDA_VERSION) \
+		--build-arg NV_CODEC_HEADERS_VERSION=$(NV_CODEC_HEADERS_VERSION) \
+		--build-arg BUILD_VERSION=$(shell ./print_version.sh) \
+		.
+
+docker_remote_transcoder_qsv:
+	docker build -t remote-transcoder-worker-qsv:$(DOCKER_TAG) -f docker/Dockerfile.remote-transcoder-qsv \
+		--build-arg FFMPEG_VERSION=$(FFMPEG_VERSION) \
+		--build-arg BUILD_VERSION=$(shell ./print_version.sh) \
+		.
 
 swagger:
 	swag init --generalInfo server/ai_mediaserver.go --outputTypes yaml --output . && mv swagger.yaml liveai.openapi.yaml

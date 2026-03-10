@@ -1,0 +1,60 @@
+FROM ubuntu:24.04 AS ffmpeg-build
+
+ARG FFMPEG_VERSION=7.1.1
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git pkg-config yasm nasm ca-certificates curl \
+    libx264-dev libx265-dev libvpx-dev \
+    libva-dev libvpl-dev \
+    intel-media-va-driver-non-free \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone --depth 1 --branch n${FFMPEG_VERSION} https://github.com/FFmpeg/FFmpeg.git /ffmpeg \
+    && cd /ffmpeg \
+    && ./configure \
+      --prefix=/opt/ffmpeg \
+      --enable-gpl --enable-nonfree \
+      --enable-libx264 --enable-libx265 --enable-libvpx \
+      --enable-libvpl --enable-vaapi \
+    && make -j"$(nproc)" && make install
+
+FROM ubuntu:24.04 AS worker-build
+
+WORKDIR /src
+ARG GO_VERSION=1.25.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config ca-certificates curl git \
+    libx264-dev libx265-dev libvpx-dev libva-dev libvpl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH="/usr/local/go/bin:${PATH}"
+COPY --from=ffmpeg-build /opt/ffmpeg /opt/ffmpeg
+ENV PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig"
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG BUILD_VERSION=0.0.0-dev
+RUN CGO_ENABLED=1 go build -o /out/remote-transcoder-worker \
+    -ldflags="-X github.com/livepeer/go-livepeer/core.LivepeerVersion=${BUILD_VERSION}" \
+    ./cmd/remote_transcoder_worker
+
+FROM ubuntu:24.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libx264-164 libx265-199 libvpx9 \
+    libva2 libva-drm2 libvpl2 libmfx-gen1.2 \
+    intel-media-va-driver-non-free \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg-build /opt/ffmpeg /opt/ffmpeg
+ENV PATH="/opt/ffmpeg/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/ffmpeg/lib"
+
+COPY --from=worker-build /out/remote-transcoder-worker /usr/local/bin/remote-transcoder-worker
+ENTRYPOINT ["/usr/local/bin/remote-transcoder-worker"]

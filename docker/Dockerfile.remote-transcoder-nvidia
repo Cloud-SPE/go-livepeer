@@ -1,0 +1,74 @@
+ARG CUDA_VERSION=12.4.1
+
+FROM nvidia/cuda:${CUDA_VERSION}-devel-ubuntu22.04 AS ffmpeg-build
+
+ARG FFMPEG_VERSION=7.1.1
+ARG NV_CODEC_HEADERS_VERSION=12.2.72.0
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential git pkg-config yasm nasm ca-certificates curl \
+    libx264-dev libx265-dev libvpx-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install NVENC headers (ffnvcodec) for ffmpeg
+RUN git clone --depth 1 --branch n${NV_CODEC_HEADERS_VERSION} https://github.com/FFmpeg/nv-codec-headers.git /nv-codec-headers \
+    && cd /nv-codec-headers \
+    && make -j"$(nproc)" \
+    && make install \
+    && rm -rf /nv-codec-headers
+
+# Build ffmpeg with NVENC/NVDEC support (flags may vary by version)
+RUN git clone --depth 1 --branch n${FFMPEG_VERSION} https://github.com/FFmpeg/FFmpeg.git /ffmpeg \
+    && cd /ffmpeg \
+    && ./configure \
+      --prefix=/opt/ffmpeg \
+      --enable-gpl --enable-nonfree \
+      --enable-libx264 --enable-libx265 --enable-libvpx \
+      --enable-cuda-nvcc --enable-nvenc --enable-libnpp \
+      --extra-cflags=-I/usr/local/cuda/include \
+      --extra-ldflags=-L/usr/local/cuda/lib64 \
+    && make -j"$(nproc)" && make install
+
+FROM ubuntu:22.04 AS worker-build
+
+WORKDIR /src
+ARG GO_VERSION=1.25.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config ca-certificates curl git \
+    libx264-dev libx265-dev libvpx-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tgz \
+    && tar -C /usr/local -xzf /tmp/go.tgz \
+    && rm /tmp/go.tgz
+ENV PATH="/usr/local/go/bin:${PATH}"
+COPY --from=ffmpeg-build /usr/local/cuda /usr/local/cuda
+ENV LD_LIBRARY_PATH="/usr/local/cuda/lib64"
+ENV LIBRARY_PATH="/usr/local/cuda/lib64"
+ENV CGO_LDFLAGS="-L/usr/local/cuda/lib64"
+COPY --from=ffmpeg-build /opt/ffmpeg /opt/ffmpeg
+ENV PKG_CONFIG_PATH="/opt/ffmpeg/lib/pkgconfig"
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG BUILD_VERSION=0.0.0-dev
+RUN CGO_ENABLED=1 go build -o /out/remote-transcoder-worker \
+    -ldflags="-X github.com/livepeer/go-livepeer/core.LivepeerVersion=${BUILD_VERSION}" \
+    ./cmd/remote_transcoder_worker
+
+FROM nvidia/cuda:${CUDA_VERSION}-runtime-ubuntu22.04 AS runtime
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    libx264-163 libx265-199 libvpx7 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg-build /opt/ffmpeg /opt/ffmpeg
+ENV PATH="/opt/ffmpeg/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/ffmpeg/lib"
+
+COPY --from=worker-build /out/remote-transcoder-worker /usr/local/bin/remote-transcoder-worker
+
+ENTRYPOINT ["/usr/local/bin/remote-transcoder-worker"]
