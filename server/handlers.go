@@ -18,6 +18,7 @@ import (
 	ethtypes "github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 	"github.com/golang/glog"
+	"github.com/livepeer/go-livepeer/byoc"
 	"github.com/livepeer/go-livepeer/clog"
 	"github.com/livepeer/go-livepeer/common"
 	"github.com/livepeer/go-livepeer/core"
@@ -270,6 +271,7 @@ func (s *LivepeerServer) setMaxPriceForCapability() http.Handler {
 type networkCapabilitiesResponse struct {
 	CapabilitiesNames map[core.Capability]string        `json:"capabilities_names"`
 	Orchestrators     []*common.OrchNetworkCapabilities `json:"orchestrators"`
+	WorkerOptions     []map[string]interface{}          `json:"worker_options,omitempty"`
 }
 
 func (s *LivepeerServer) getNetworkCapabilitiesHandler() http.Handler {
@@ -284,6 +286,12 @@ func (s *LivepeerServer) getNetworkCapabilitiesHandler() http.Handler {
 			networkCapabilities := &networkCapabilitiesResponse{
 				CapabilitiesNames: core.CapabilityNameLookup,
 				Orchestrators:     orchNetworkCaps,
+			}
+
+			if s.LivepeerNode.OrchestratorPool != nil {
+				orchInfos := s.LivepeerNode.OrchestratorPool.GetInfos()
+				networkCapabilities.WorkerOptions = byoc.FetchWorkerOptions(r.Context(), orchInfos, 2*time.Second)
+				glog.Infof("getNetworkCapabilities fetched worker_options num_orchs=%v num_options=%v", len(orchInfos), len(networkCapabilities.WorkerOptions))
 			}
 
 			respondJson(w, networkCapabilities)

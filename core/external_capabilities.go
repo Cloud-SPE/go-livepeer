@@ -15,19 +15,16 @@ import (
 )
 
 type ExternalCapability struct {
-	Name                       string                 `json:"name"`
-	Description                string                 `json:"description"`
-	Url                        string                 `json:"url"`
-	OptionsEndpoint            string                 `json:"options_endpoint,omitempty"`
-	OptionsPollIntervalSeconds int                    `json:"options_poll_interval_seconds,omitempty"`
-	Capacity                   int                    `json:"capacity"`
-	PricePerUnit               int64                  `json:"price_per_unit"`
-	PriceScaling               int64                  `json:"price_scaling"`
-	PriceCurrency              string                 `json:"currency"`
-	WorkerOptions              []map[string]interface{} `json:"worker_options,omitempty"`
+	Name          string                   `json:"name"`
+	Description   string                   `json:"description"`
+	Url           string                   `json:"url"`
+	Capacity      int                      `json:"capacity"`
+	PricePerUnit  int64                    `json:"price_per_unit"`
+	PriceScaling  int64                    `json:"price_scaling"`
+	PriceCurrency string                   `json:"currency"`
+	WorkerOptions []map[string]interface{} `json:"worker_options,omitempty"`
 
-	price              *AutoConvertedPrice
-	optionsLastUpdated time.Time
+	price *AutoConvertedPrice
 
 	Mu   sync.RWMutex
 	Load int
@@ -241,6 +238,87 @@ func (extCaps *ExternalCapabilities) GetCapabilityRunner(name, url string) (*Ext
 	return cap, ok
 }
 
+// GetTotalCapacity returns the sum of available capacity across all runners for
+// the given capability name. It holds capm for the entire read.
+func (extCaps *ExternalCapabilities) GetTotalCapacity(name string) int64 {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return 0
+	}
+	var total int64
+	for _, cap := range runners {
+		if cap.Load < cap.Capacity {
+			total += int64(cap.Capacity - cap.Load)
+		}
+	}
+	return total
+}
+
+// GetFilteredCapacity returns the sum of available capacity across runners for
+// the given capability name that also satisfy the options filter.
+// If filter is empty, all runners are counted (equivalent to GetTotalCapacity).
+func (extCaps *ExternalCapabilities) GetFilteredCapacity(name string, filter map[string]string) int64 {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return 0
+	}
+	var total int64
+	for _, cap := range runners {
+		if !AnyOptionsMatch(filter, cap.GetWorkerOptionsCopy()) {
+			continue
+		}
+		if cap.Load < cap.Capacity {
+			total += int64(cap.Capacity - cap.Load)
+		}
+	}
+	return total
+}
+
+// ReserveCapacity atomically finds the first runner with available capacity and
+// increments its Load. Returns an error if no runner has available capacity.
+func (extCaps *ExternalCapabilities) ReserveCapacity(name string) error {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return fmt.Errorf("external capability not found: %s", name)
+	}
+	for _, cap := range runners {
+		cap.Mu.Lock()
+		if cap.Load < cap.Capacity {
+			cap.Load++
+			cap.Mu.Unlock()
+			return nil
+		}
+		cap.Mu.Unlock()
+	}
+	return fmt.Errorf("no available capacity for capability: %s", name)
+}
+
+// FreeCapacity decrements the Load of the first runner with non-zero Load.
+func (extCaps *ExternalCapabilities) FreeCapacity(name string) error {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+	runners, ok := extCaps.Capabilities[name]
+	if !ok {
+		return fmt.Errorf("external capability not found: %s", name)
+	}
+	for _, cap := range runners {
+		cap.Mu.Lock()
+		if cap.Load > 0 {
+			cap.Load--
+			cap.Mu.Unlock()
+			return nil
+		}
+		cap.Mu.Unlock()
+	}
+	return fmt.Errorf("external capability not found: %s", name)
+}
+
 // SelectRunner returns the runner with the most available capacity for the given
 // capability name that also satisfies the options filter. If filter is empty all
 // runners are considered. Returns nil if no matching runner is found.
@@ -372,7 +450,6 @@ func (extCap *ExternalCapability) SetWorkerOptions(options []map[string]interfac
 	extCap.Mu.Lock()
 	defer extCap.Mu.Unlock()
 	extCap.WorkerOptions = copyWorkerOptionsList(options)
-	extCap.optionsLastUpdated = time.Now()
 }
 
 func (extCap *ExternalCapability) GetWorkerOptionsCopy() []map[string]interface{} {
@@ -381,17 +458,6 @@ func (extCap *ExternalCapability) GetWorkerOptionsCopy() []map[string]interface{
 	return copyWorkerOptionsList(extCap.WorkerOptions)
 }
 
-func (extCap *ExternalCapability) GetOptionsPollConfig() (string, time.Duration) {
-	extCap.Mu.RLock()
-	defer extCap.Mu.RUnlock()
-
-	interval := 30 * time.Second
-	if extCap.OptionsPollIntervalSeconds > 0 {
-		interval = time.Duration(extCap.OptionsPollIntervalSeconds) * time.Second
-	}
-
-	return extCap.OptionsEndpoint, interval
-}
 
 func copyWorkerOptionsList(in []map[string]interface{}) []map[string]interface{} {
 	if len(in) == 0 {
@@ -408,15 +474,3 @@ func copyWorkerOptionsList(in []map[string]interface{}) []map[string]interface{}
 	return out
 }
 
-func copyWorkerOptions(in map[string]interface{}) map[string]interface{} {
-	if len(in) == 0 {
-		return nil
-	}
-
-	out := make(map[string]interface{}, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-
-	return out
-}

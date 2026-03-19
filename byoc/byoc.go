@@ -201,23 +201,17 @@ type BYOCOrchestratorServer struct {
 
 	httpMux *http.ServeMux
 
-	sharedBalMtx      *sync.Mutex
-	optionsPollMu     *sync.Mutex
-	optionsPollCancel map[string]context.CancelFunc
-	optionsHTTPClient *http.Client
+	sharedBalMtx *sync.Mutex
 }
 
 func NewBYOCOrchestratorServer(node *core.LivepeerNode, orch Orchestrator, trickleSrv *trickle.Server, trickleBasePath string, mux *http.ServeMux) *BYOCOrchestratorServer {
 	bso := &BYOCOrchestratorServer{
-		node:              node,
-		orch:              orch,
-		trickleSrv:        trickleSrv,
-		trickleBasePath:   trickleBasePath,
-		httpMux:           mux,
-		sharedBalMtx:      &sync.Mutex{},
-		optionsPollMu:     &sync.Mutex{},
-		optionsPollCancel: make(map[string]context.CancelFunc),
-		optionsHTTPClient: &http.Client{},
+		node:            node,
+		orch:            orch,
+		trickleSrv:      trickleSrv,
+		trickleBasePath: trickleBasePath,
+		httpMux:         mux,
+		sharedBalMtx:    &sync.Mutex{},
 	}
 
 	bso.registerRoutes()

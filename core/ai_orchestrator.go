@@ -1139,62 +1139,23 @@ func (orch *orchestrator) RemoveExternalCapability(extCapability string) error {
 }
 
 func (orch *orchestrator) GetUrlForCapability(extCapability string) string {
-	runners, ok := orch.node.ExternalCapabilities.Capabilities[extCapability]
-	if !ok {
+	cap, ok := orch.node.ExternalCapabilities.GetCapability(extCapability)
+	if !ok || cap == nil {
 		return ""
 	}
-	for _, cap := range runners {
-		return cap.Url
-	}
-	return ""
+	return cap.Url
 }
 
 func (orch *orchestrator) CheckExternalCapabilityCapacity(extCapability string) int64 {
-	runners, ok := orch.node.ExternalCapabilities.Capabilities[extCapability]
-	if !ok {
-		return 0
-	}
-	var total int64
-	for _, cap := range runners {
-		if cap.Load < cap.Capacity {
-			total += int64(cap.Capacity - cap.Load)
-		}
-	}
-	return total
+	return orch.node.ExternalCapabilities.GetTotalCapacity(extCapability)
 }
 
 func (orch *orchestrator) ReserveExternalCapabilityCapacity(extCapability string) error {
-	runners, ok := orch.node.ExternalCapabilities.Capabilities[extCapability]
-	if !ok {
-		return errors.New("external capability not found")
-	}
-	for _, cap := range runners {
-		cap.Mu.Lock()
-		if cap.Load < cap.Capacity {
-			cap.Load++
-			cap.Mu.Unlock()
-			return nil
-		}
-		cap.Mu.Unlock()
-	}
-	return errors.New("external capability not found")
+	return orch.node.ExternalCapabilities.ReserveCapacity(extCapability)
 }
 
 func (orch *orchestrator) FreeExternalCapabilityCapacity(extCapability string) error {
-	runners, ok := orch.node.ExternalCapabilities.Capabilities[extCapability]
-	if !ok {
-		return errors.New("external capability not found")
-	}
-	for _, cap := range runners {
-		cap.Mu.Lock()
-		if cap.Load > 0 {
-			cap.Load--
-			cap.Mu.Unlock()
-			return nil
-		}
-		cap.Mu.Unlock()
-	}
-	return errors.New("external capability not found")
+	return orch.node.ExternalCapabilities.FreeCapacity(extCapability)
 }
 
 func (orch *orchestrator) JobPriceInfo(sender ethcommon.Address, jobCapability string) (*net.PriceInfo, error) {
