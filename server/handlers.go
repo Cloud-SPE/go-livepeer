@@ -271,7 +271,6 @@ func (s *LivepeerServer) setMaxPriceForCapability() http.Handler {
 type networkCapabilitiesResponse struct {
 	CapabilitiesNames map[core.Capability]string        `json:"capabilities_names"`
 	Orchestrators     []*common.OrchNetworkCapabilities `json:"orchestrators"`
-	WorkerOptions     []map[string]interface{}          `json:"worker_options,omitempty"`
 }
 
 func (s *LivepeerServer) getNetworkCapabilitiesHandler() http.Handler {
@@ -283,18 +282,42 @@ func (s *LivepeerServer) getNetworkCapabilitiesHandler() http.Handler {
 				respond500(w, "network capabilities not available")
 			}
 
-			networkCapabilities := &networkCapabilitiesResponse{
+			// Fan out to each orchestrator to fetch per-capability worker options.
+			// Build shallow copies of each cached struct so we never mutate the
+			// shared pointers held by LivepeerNode.NetworkCapabilities.
+			const optionsTimeout = 2 * time.Second
+			type result struct {
+				uri  string
+				opts map[string][]map[string]interface{}
+			}
+			resultCh := make(chan result, len(orchNetworkCaps))
+			for _, orch := range orchNetworkCaps {
+				go func(uri string) {
+					resultCh <- result{uri: uri, opts: byoc.FetchCapabilityOptions(r.Context(), uri, optionsTimeout)}
+				}(orch.OrchURI)
+			}
+			optsByURI := make(map[string]map[string][]map[string]interface{}, len(orchNetworkCaps))
+			for range orchNetworkCaps {
+				res := <-resultCh
+				if len(res.opts) > 0 {
+					optsByURI[res.uri] = res.opts
+				}
+			}
+			glog.Infof("getNetworkCapabilities fetched capability_options num_orchs=%v num_with_options=%v", len(orchNetworkCaps), len(optsByURI))
+
+			// Copy each cached struct before setting CapabilityOptions so we
+			// never write back to the pointers owned by the discovery cache.
+			responseOrchNetworkCaps := make([]*common.OrchNetworkCapabilities, len(orchNetworkCaps))
+			for i, orch := range orchNetworkCaps {
+				cp := *orch
+				cp.CapabilityOptions = optsByURI[orch.OrchURI]
+				responseOrchNetworkCaps[i] = &cp
+			}
+
+			respondJson(w, &networkCapabilitiesResponse{
 				CapabilitiesNames: core.CapabilityNameLookup,
-				Orchestrators:     orchNetworkCaps,
-			}
-
-			if s.LivepeerNode.OrchestratorPool != nil {
-				orchInfos := s.LivepeerNode.OrchestratorPool.GetInfos()
-				networkCapabilities.WorkerOptions = byoc.FetchWorkerOptions(r.Context(), orchInfos, 2*time.Second)
-				glog.Infof("getNetworkCapabilities fetched worker_options num_orchs=%v num_options=%v", len(orchInfos), len(networkCapabilities.WorkerOptions))
-			}
-
-			respondJson(w, networkCapabilities)
+				Orchestrators:     responseOrchNetworkCaps,
+			})
 			return
 		} else {
 			respond400(w, "Node must be gateway node to get network capabilities")

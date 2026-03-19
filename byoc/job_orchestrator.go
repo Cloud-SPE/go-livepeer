@@ -127,14 +127,14 @@ func (bso *BYOCOrchestratorServer) GetWorkerOptions() http.Handler {
 			return
 		}
 
-		options := []map[string]interface{}{}
+		options := map[string][]map[string]interface{}{}
 		if bso.node != nil && bso.node.ExternalCapabilities != nil {
-			if all := bso.node.ExternalCapabilities.GetAllWorkerOptions(); all != nil {
+			if all := bso.node.ExternalCapabilities.GetAllWorkerOptionsByCapability(); len(all) > 0 {
 				options = all
 			}
 		}
 		optsJSON, _ := json.Marshal(options)
-		clog.Infof(r.Context(), "GetWorkerOptions remoteAddr=%v num_options=%v options=%v", r.RemoteAddr, len(options), string(optsJSON))
+		clog.Infof(r.Context(), "GetWorkerOptions remoteAddr=%v num_capabilities=%v options=%v", r.RemoteAddr, len(options), string(optsJSON))
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(options)

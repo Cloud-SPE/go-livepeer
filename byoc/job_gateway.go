@@ -551,9 +551,45 @@ func getToken(ctx context.Context, respTimeout time.Duration, orchUrl, capabilit
 // FetchWorkerOptions fans out GET /process/options to each orchestrator URL,
 // merges the results, and returns the deduplicated union. timeout controls
 // how long to wait for all responses.
+// FetchCapabilityOptions calls GET /process/options on a single orchestrator URL
+// and returns the per-capability options map. Returns nil on any error.
+func FetchCapabilityOptions(ctx context.Context, orchURL string, timeout time.Duration) map[string][]map[string]interface{} {
+	reqCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, strings.TrimRight(orchURL, "/")+"/process/options", nil)
+	if err != nil {
+		clog.Errorf(ctx, "FetchCapabilityOptions orch=%v failed to create request err=%v", orchURL, err)
+		return nil
+	}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		clog.V(common.VERBOSE).Infof(ctx, "FetchCapabilityOptions orch=%v request failed err=%v", orchURL, err)
+		return nil
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		clog.V(common.VERBOSE).Infof(ctx, "FetchCapabilityOptions orch=%v non-200 status=%v", orchURL, resp.StatusCode)
+		return nil
+	}
+	var opts map[string][]map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&opts); err != nil {
+		clog.Errorf(ctx, "FetchCapabilityOptions orch=%v failed to decode response err=%v", orchURL, err)
+		return nil
+	}
+	if clog.V(common.VERBOSE) {
+		optsJSON, _ := json.Marshal(opts)
+		clog.Infof(ctx, "FetchCapabilityOptions orch=%v received options=%v", orchURL, string(optsJSON))
+	}
+	return opts
+}
+
+// FetchWorkerOptions fans out GET /process/options to each orchestrator URL,
+// merges the results, and returns the deduplicated union as a flat list.
+// Used by the gateway's /process/options aggregator for model discovery.
 func FetchWorkerOptions(ctx context.Context, orchs []common.OrchestratorLocalInfo, timeout time.Duration) []map[string]interface{} {
 	type orchResult struct {
-		options []map[string]interface{}
+		capOpts map[string][]map[string]interface{}
 	}
 	resultCh := make(chan orchResult, len(orchs))
 
@@ -568,51 +604,22 @@ func FetchWorkerOptions(ctx context.Context, orchs []common.OrchestratorLocalInf
 
 	for _, orch := range orchs {
 		go func(orchURL string) {
-			req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, orchURL+"/process/options", nil)
-			if err != nil {
-				clog.Errorf(ctx, "FetchWorkerOptions orch=%v failed to create request err=%v", orchURL, err)
-				resultCh <- orchResult{}
-				return
-			}
-			resp, err := httpClient.Do(req)
-			if err != nil {
-				clog.Errorf(ctx, "FetchWorkerOptions orch=%v request failed err=%v", orchURL, err)
-				resultCh <- orchResult{}
-				return
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode != http.StatusOK {
-				clog.Errorf(ctx, "FetchWorkerOptions orch=%v non-200 status=%v", orchURL, resp.StatusCode)
-				resultCh <- orchResult{}
-				return
-			}
-
-			var opts []map[string]interface{}
-			if err := json.NewDecoder(resp.Body).Decode(&opts); err != nil {
-				clog.Errorf(ctx, "FetchWorkerOptions orch=%v failed to decode response err=%v", orchURL, err)
-				resultCh <- orchResult{}
-				return
-			}
-			optsJSON, _ := json.Marshal(opts)
-			clog.Infof(ctx, "FetchWorkerOptions orch=%v received num_options=%v options=%v", orchURL, len(opts), string(optsJSON))
-			resultCh <- orchResult{options: opts}
+			resultCh <- orchResult{capOpts: FetchCapabilityOptions(reqCtx, orchURL, timeout)}
 		}(orch.URL.String())
 	}
 
-	// Collect results; deduplicate by stable JSON fingerprint.
-	// encoding/json marshals map keys in sorted order, so this is deterministic.
+	// Collect and flatten all per-capability options; deduplicate by JSON fingerprint.
 	seen := make(map[string]struct{})
 	all := make([]map[string]interface{}, 0)
 	for range orchs {
 		res := <-resultCh
-		for _, opt := range res.options {
-			key, _ := json.Marshal(opt)
-			if _, dup := seen[string(key)]; !dup {
-				seen[string(key)] = struct{}{}
-				all = append(all, opt)
-			} else {
-				clog.V(common.VERBOSE).Infof(ctx, "FetchWorkerOptions skipping duplicate key=%v", string(key))
+		for _, opts := range res.capOpts {
+			for _, opt := range opts {
+				key, _ := json.Marshal(opt)
+				if _, dup := seen[string(key)]; !dup {
+					seen[string(key)] = struct{}{}
+					all = append(all, opt)
+				}
 			}
 		}
 	}

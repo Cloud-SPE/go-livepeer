@@ -408,6 +408,22 @@ func (extCaps *ExternalCapabilities) GetAllWorkerOptions() []map[string]interfac
 	return result
 }
 
+// GetAllWorkerOptionsByCapability returns the cached WorkerOptions grouped by
+// capability name. Each key is a capability name; the value is the merged
+// options from all runners registered for that capability.
+func (extCaps *ExternalCapabilities) GetAllWorkerOptionsByCapability() map[string][]map[string]interface{} {
+	extCaps.capm.Lock()
+	defer extCaps.capm.Unlock()
+
+	result := make(map[string][]map[string]interface{})
+	for capName, runners := range extCaps.Capabilities {
+		for _, cap := range runners {
+			result[capName] = append(result[capName], cap.GetWorkerOptionsCopy()...)
+		}
+	}
+	return result
+}
+
 func (extCaps *ExternalCapabilities) RegisterCapability(extCapability string) (*ExternalCapability, error) {
 	extCaps.capm.Lock()
 	defer extCaps.capm.Unlock()
