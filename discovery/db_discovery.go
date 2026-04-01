@@ -2,9 +2,11 @@ package discovery
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	gonet "net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,6 +25,23 @@ import (
 
 	"github.com/golang/glog"
 )
+
+// orchDrainHTTPClient is used for /events/drain calls to orchestrators.
+// Orchestrators commonly use self-signed TLS certificates (the same pattern
+// as the rest of the Livepeer gateway→orchestrator HTTP path), so certificate
+// verification is intentionally skipped.
+var orchDrainTLSConfig = &tls.Config{InsecureSkipVerify: true}
+var orchDrainHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		TLSClientConfig: orchDrainTLSConfig,
+		DialTLSContext: func(ctx context.Context, network, addr string) (gonet.Conn, error) {
+			tlsDialer := &tls.Dialer{Config: orchDrainTLSConfig}
+			return tlsDialer.DialContext(ctx, network, addr)
+		},
+		ForceAttemptHTTP2: true,
+	},
+	Timeout: 5 * time.Second,
+}
 
 type ticketParamsValidator interface {
 	ValidateTicketParams(ticketParams *pm.TicketParams) error
@@ -492,7 +511,7 @@ func fetchOrchEventsSince(ctx context.Context, orchURI string, sinceMs int64) ([
 	if err != nil {
 		return nil, err
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := orchDrainHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
