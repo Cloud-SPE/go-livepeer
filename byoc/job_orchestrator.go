@@ -547,7 +547,14 @@ func (bso *BYOCOrchestratorServer) verifyJobCreds(ctx context.Context, jobCreds 
 		return nil, errSegSig
 	}
 
-	if !bso.orch.VerifySig(ethcommon.HexToAddress(jobData.Sender), jobData.Request+jobData.Parameters, sigByte) {
+	v1Payload := FlattenBYOCJob(&BYOCJobSigningInput{
+		ID:             jobData.ID,
+		Capability:     jobData.Capability,
+		Request:        jobData.Request,
+		Parameters:     jobData.Parameters,
+		TimeoutSeconds: jobData.Timeout,
+	})
+	if !bso.orch.VerifySig(ethcommon.HexToAddress(jobData.Sender), string(v1Payload), sigByte) {
 		clog.Errorf(ctx, "Sig check failed sender=%v", jobData.Sender)
 		return nil, errSegSig
 	}
